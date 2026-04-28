@@ -7,7 +7,7 @@ centralWidgetVisible: 1
 orthographicViewHeight: 1
 textFiles: -1
 consoles: Console:All:All
-renderingDevicePerspectives: NAO:CameraBottom;1;0.848611;0;0
-renderingDevicePerspectives: NAO:CameraTop;1;0.848611;0;0
-renderingDevicePerspectives: laptop:display;0;1.5275;0;0
+renderingDevicePerspectives: NAO:CameraBottom;1;0.223611;0;0
+renderingDevicePerspectives: NAO:CameraTop;0;0.598437;0;0
+renderingDevicePerspectives: laptop:display;0;1.075;0;0
 renderingDevicePerspectives: television:display;0;1;0;0

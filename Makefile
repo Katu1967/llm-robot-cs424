@@ -8,6 +8,7 @@ WEBOTS_CONTROLLER := $(WEBOTS_HOME)/Contents/MacOS/webots-controller
 MODELS_DIR        := src/models
 SCRIPT            := src/nao_cam.py
 ROBOT_NAME        := NAO
+PORT              ?= 1234
 
 # YOLO model URLs
 WEIGHTS_URL := https://pjreddie.com/media/files/yolov3.weights
@@ -28,8 +29,8 @@ all: help
 # ---------------------------------------------------------------------------
 ## run         — download models (if needed) then launch the NAO controller
 run: models
-	@echo ">>> Starting NAO YOLO controller (robot=$(ROBOT_NAME))…"
-	$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) $(SCRIPT)
+	@echo ">>> Starting NAO YOLO controller (robot=$(ROBOT_NAME), port=$(PORT))…"
+	$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) $(SCRIPT)
 
 # ---------------------------------------------------------------------------
 ## models      — download YOLO model files into src/models/ (skips if present)
@@ -73,4 +74,5 @@ help:
 	@echo "  Typical first-time setup:"
 	@echo "    make install   # install Python deps"
 	@echo "    make run       # downloads models then launches Webots controller"
+	@echo "    make run PORT=1235 # run on a specific port"
 	@echo ""
