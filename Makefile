@@ -20,8 +20,11 @@ WEIGHTS := $(MODELS_DIR)/yolov3.weights
 CFG     := $(MODELS_DIR)/yolov3.cfg
 NAMES   := $(MODELS_DIR)/coco.names
 
+# Ollama settings
+OLLAMA_MODEL ?= llama3.2-vision
+
 # ---------------------------------------------------------------------------
-.PHONY: all run models install clean help
+.PHONY: all run models install pull-model serve clean help
 
 # Default target
 all: help
@@ -56,6 +59,18 @@ $(NAMES): | $(MODELS_DIR)
 install:
 	@echo ">>> Installing Python dependencies…"
 	pip install -r requirements.txt
+
+# ---------------------------------------------------------------------------
+## pull-model  — download the Llama 3 model via Ollama (~5 GB for vision)
+pull-model:
+	@echo ">>> Pulling $(OLLAMA_MODEL) via Ollama…"
+	ollama pull $(OLLAMA_MODEL)
+
+# ---------------------------------------------------------------------------
+## serve       — start the Ollama server in the background
+serve:
+	@echo ">>> Starting Ollama server…"
+	ollama serve
 
 # ---------------------------------------------------------------------------
 ## clean       — remove downloaded model files (keeps src/models/ directory)

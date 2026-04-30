@@ -1,6 +1,6 @@
 """
-NAO camera stream with live YOLO object detection overlay
-and LLM scene-state extraction.
+NAO camera stream with live YOLO object detection overlay,
+LLM scene-state extraction, and GPT-4 task planning.
 
 Running command:
   make run
@@ -9,12 +9,12 @@ Running command:
 
 Controls:
   q      – quit
-  SPACE  – trigger an immediate scene-state extraction + LLM dispatch
-  +/=    – increase detection frequency (run YOLO more often)
-  -      – decrease detection frequency (run YOLO less often)
+  SPACE  – immediately capture scene state and publish to bus
+  +/=    – increase YOLO detection frequency
+  -      – decrease YOLO detection frequency
 
-Model files must be placed in src/models/:
-  yolov3.cfg, yolov3.weights, coco.names
+Model files must be in src/models/:  yolov3.cfg, yolov3.weights, coco.names
+API key must be in .env:             GOOGLE_API_KEY=AIza...
 """
 
 import numpy as np
@@ -23,31 +23,29 @@ from controller import Robot
 
 from yolo_detection import YOLODetector
 from scene_state    import SceneStateExtractor
-from llm_bridge     import LLMBridge
+from scene_bus      import SceneBus
+from task_planner   import TaskPlanner
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-TIMESTEP     = 32           # ms; must be a multiple of world's basicTimeStep
-CAMERA_NAME  = "CameraTop"  # or "CameraBottom"
+TIMESTEP    = 32            # ms — must be a multiple of world's basicTimeStep
+CAMERA_NAME = "CameraTop"   # or "CameraBottom"
 
-# YOLO — how often to run inference
-DETECT_EVERY_N_FRAMES  = 5   # run YOLO every N frames
-CONFIDENCE_THRESHOLD   = 0.5
-NMS_THRESHOLD          = 0.4
-YOLO_INPUT_SIZE        = (416, 416)
+# YOLO inference frequency
+DETECT_EVERY_N_FRAMES = 5
+CONFIDENCE_THRESHOLD  = 0.5
+NMS_THRESHOLD         = 0.4
+YOLO_INPUT_SIZE       = (416, 416)
 
-# Scene extraction — automatic periodic trigger
-# Set to 0 to disable automatic triggering (manual SPACE only).
-SCENE_EXTRACT_EVERY_N_FRAMES = 150   # ~5 s at 31 fps
-
-# LLM Bridge — set verbose=False to suppress the full JSON dump
-LLM_VERBOSE = True
+# Scene extraction — automatic periodic trigger.
+# Set to 0 to disable (SPACE-only triggering).
+SCENE_EXTRACT_EVERY_N_FRAMES = 60   # ≈ 2 s at 31 fps  (set 0 to use SPACE only)
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
@@ -77,8 +75,16 @@ def main():
     # --- Scene state extractor ---
     extractor = SceneStateExtractor(robot, camera, TIMESTEP, CAMERA_NAME)
 
-    # --- LLM bridge ---
-    bridge = LLMBridge(verbose=LLM_VERBOSE)
+    # --- SceneBus (topic-based message backbone) ---
+    bus = SceneBus()
+
+    # --- TaskPlanner — constructed here (AFTER camera/YOLO) so the heavy
+    #     google.generativeai import happens after Webots is already running ---
+    print("[nao_cam] Initialising TaskPlanner (loading Gemini…)")
+    planner = TaskPlanner()
+    planner.attach(bus)
+    print("[nao_cam] All systems ready. Starting main loop.")
+    print("[nao_cam] Press SPACE in the camera window to trigger a scene capture.")
 
     # --- Display window ---
     cv2.namedWindow("NAO Camera – YOLO", cv2.WINDOW_AUTOSIZE)
@@ -94,23 +100,25 @@ def main():
 
         # Webots returns BGRA bytes
         img = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 4))
-        bgr = img[:, :, :3]  # drop alpha
+        bgr = img[:, :, :3]
 
-        # --- YOLO inference (every N frames) ---
+        # --- YOLO inference ---
         if frame_count % detect_interval == 0:
             last_detections = detector.detect(bgr)
 
         # --- Annotate display frame ---
         annotated = detector.annotate(bgr, last_detections)
 
+        # HUD overlay
+        planning_flag = " [PLANNING…]" if planner.is_planning() else ""
+        waiting_flag  = " [WAITING FOR GOAL]" if planner.is_waiting_for_user() else ""
         hud = (
             f"Objects: {len(last_detections)}  |  "
             f"Detect/{detect_interval}f  |  "
-            f"[SPACE] extract  [+/-] freq  [q] quit"
+            f"[SPACE] capture{planning_flag}{waiting_flag}  [q] quit"
         )
         cv2.putText(
-            annotated, hud,
-            (8, 20),
+            annotated, hud, (8, 20),
             cv2.FONT_HERSHEY_SIMPLEX, 0.45,
             (0, 255, 0), 1, cv2.LINE_AA,
         )
@@ -132,19 +140,22 @@ def main():
             detect_interval += 1
             print(f"[nao_cam] Detect interval → {detect_interval}")
 
-        # --- Automatic periodic trigger ---
+        # --- Automatic periodic trigger (skip if planner is busy or waiting for user) ---
         if (
             trigger is None
             and SCENE_EXTRACT_EVERY_N_FRAMES > 0
             and frame_count > 0
             and frame_count % SCENE_EXTRACT_EVERY_N_FRAMES == 0
+            and not planner.is_planning()
+            and not planner.is_waiting_for_user()
         ):
             trigger = "periodic"
 
-        # --- Scene extraction + LLM dispatch ---
+        # --- Capture scene state and publish to bus ---
         if trigger is not None:
             sim_time_ms = int(robot.getTime() * 1000)
-            print(f"\n[nao_cam] Scene extraction triggered ({trigger}) @ {sim_time_ms} ms")
+            print(f"\n[nao_cam] Scene capture triggered ({trigger}) @ {sim_time_ms} ms")
+
             state, snapshot_path = extractor.capture(
                 bgr_frame=bgr,
                 detections=last_detections,
@@ -152,7 +163,9 @@ def main():
                 frame_count=frame_count,
                 trigger=trigger,
             )
-            bridge.send(state, snapshot_path)
+
+            # Publish to bus — TaskPlanner (and any other subscribers) will react
+            bus.publish("scene_state", state, snapshot_path)
 
         frame_count += 1
 
