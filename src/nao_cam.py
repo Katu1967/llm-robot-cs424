@@ -25,6 +25,8 @@ from yolo_detection import YOLODetector
 from scene_state    import SceneStateExtractor
 from scene_bus      import SceneBus
 from task_planner   import TaskPlanner
+from nao_interface import NaoInterface
+from plan_executor import PlanExecutor, ExecutorState
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -83,6 +85,8 @@ def main():
     print("[nao_cam] Initialising TaskPlanner (loading Gemini…)")
     planner = TaskPlanner()
     planner.attach(bus)
+    nao      = NaoInterface(robot, TIMESTEP)
+    executor = PlanExecutor(nao, scene_bus=bus)
     print("[nao_cam] All systems ready. Starting main loop.")
     print("[nao_cam] Press SPACE in the camera window to trigger a scene capture.")
 
@@ -148,6 +152,7 @@ def main():
             and frame_count % SCENE_EXTRACT_EVERY_N_FRAMES == 0
             and not planner.is_planning()
             and not planner.is_waiting_for_user()
+            and executor.is_idle
         ):
             trigger = "periodic"
 
@@ -166,6 +171,18 @@ def main():
 
             # Publish to bus — TaskPlanner (and any other subscribers) will react
             bus.publish("scene_state", state, snapshot_path)
+            
+        # ── Execution ─────────────────────────────────
+        # ── Execution ─────────────────────────────────
+        new_plan = planner.get_plan()
+        if new_plan:
+            print(f"[DEBUG] Plan available, executor.is_idle={executor.is_idle}, state={executor.state}")
+            if executor.is_idle:
+                loaded = executor.load_plan(new_plan)
+                print(f"[DEBUG] load_plan returned: {loaded}")
+                planner.consume_plan()
+
+        executor.tick()
 
         frame_count += 1
 

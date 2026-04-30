@@ -81,10 +81,44 @@ for the robot to accomplish the given goal.
              25 joint position encoders
 
 ## Available Tools / Actions
-[TOOLS WILL BE REGISTERED HERE IN A FUTURE UPDATE]
+You MUST use ONLY these exact action names. Do not invent new action names.
 
-For now, describe actions in plain English inside the "description" field.
-Use the "action" field as a placeholder action name (snake_case).
+Primitive:
+  turn_left        { "degrees": <number> }   ← use this, NOT "adjust_orientation"
+  turn_right       { "degrees": <number> }
+  move_forward     { "meters": <number> }    ← parameter is "meters", NOT "distance_m"
+  move_backward    { "meters": <number> }
+  stop             {}
+  set_head_yaw     { "angle": <radians> }
+  set_head_pitch   { "angle": <radians> }
+  wave             { "cycles": <int> }
+
+Semantic (use when objects are detected):
+  look_for_object      { "label": "<coco_name>", "timeout_s": <number> }
+  center_on_object     { "label": "<coco_name>", "tolerance": 0.1, "timeout_s": 5 }
+  move_toward_object   { "label": "<coco_name>", "target_height": 0.35, "timeout_s": 10 }
+  pick_object          { "label": "<coco_name>" }
+  place_object         {}
+
+CRITICAL RULES:
+- Never use "adjust_orientation", "rotate", "navigate_to", or any name not in the list above.
+- To turn, use turn_left or turn_right with a "degrees" parameter.
+- To move, use move_forward with a "meters" parameter (not "distance_m").
+- You cannot navigate to named rooms — you can only turn and move forward.
+- If no objects are detected, use only primitive actions.
+- For furniture goals, map common words to COCO labels when needed:
+    "table" or "wood table" → "dining table".
+- If the target object is visible in scene.objects, prefer object-guided actions
+    like center_on_object and move_toward_object instead of a blind fixed-distance move.
+- Do not invent a wall or room orientation if the object is already visible; use
+    the detected object label and the scene state.
+- For pickup or approach tasks involving a visible object, the default plan should be:
+        1. center_on_object
+        2. move_toward_object
+        3. pick_object (only if the goal implies grasping)
+    Use move_forward only when the target object is not visible or not detectable.
+- If the task mentions a visible object by a common name, resolve it to the COCO
+    label first, then plan against that label.
 
 ## Scene State Fields (summary)
 - meta              : trigger reason, sim time, frame count, snapshot path
@@ -233,6 +267,10 @@ class TaskPlanner:
         """Return the most recently produced plan, or None."""
         with self._lock:
             return self._current_plan
+    def consume_plan(self) -> None:
+        """Mark the current plan as consumed so it isn't re-executed."""
+        with self._lock:
+            self._current_plan = None
 
     def is_planning(self) -> bool:
         """True while the background LLM call is in progress."""
@@ -359,6 +397,7 @@ class TaskPlanner:
         t0 = time.time()
         try:
             plan = self._call_llama(task, state, snapshot_path, failure_context)
+            plan = self._postprocess_plan(plan, task, state)
             elapsed = time.time() - t0
 
             with self._lock:
@@ -410,6 +449,95 @@ class TaskPlanner:
             print(f"[TaskPlanner] Could not parse Llama response as JSON: {e}")
             print(f"[TaskPlanner] Raw response: {raw[:300]}…")
             return {"raw_response": raw, "plan": [], "reasoning": "Parse error."}
+
+    def _postprocess_plan(self, plan: dict, task: Optional[str], state: dict) -> dict:
+        """
+        Apply a deterministic correction for visible-object tasks.
+
+        If the task clearly refers to an object that is visible in the current
+        scene, replace blind move-forward steps with object-guided motion.
+        """
+        steps = plan.get("plan", []) if isinstance(plan, dict) else []
+        if not steps:
+            return plan
+
+        target_label = self._infer_target_label(task, state)
+        if target_label is None:
+            return plan
+
+        if not self._is_object_visible(state, target_label):
+            return plan
+
+        goal_text = (task or "").lower()
+        wants_grasp = any(word in goal_text for word in ("pick", "grab", "take", "lift", "collect"))
+        if not wants_grasp and not any(word in goal_text for word in ("walk to", "go to", "approach", "move to", "reach")):
+            return plan
+
+        guided_steps = [
+            {
+                "step": 1,
+                "action": "center_on_object",
+                "parameters": {"label": target_label, "tolerance": 0.10, "timeout_s": 5},
+                "description": f"Center on the visible {target_label}.",
+            },
+            {
+                "step": 2,
+                "action": "move_toward_object",
+                "parameters": {"label": target_label, "target_height": 0.35, "timeout_s": 10},
+                "description": f"Move toward the visible {target_label}.",
+            },
+        ]
+
+        if wants_grasp:
+            guided_steps.append(
+                {
+                    "step": 3,
+                    "action": "pick_object",
+                    "parameters": {"label": target_label},
+                    "description": f"Pick up the {target_label}.",
+                }
+            )
+
+        revised = dict(plan)
+        revised["plan"] = guided_steps
+
+        reasoning = revised.get("reasoning", "") or ""
+        note = f"Visible target '{target_label}' detected, so the plan was converted to object-guided motion."
+        revised["reasoning"] = f"{reasoning} {note}".strip()
+        return revised
+
+    def _infer_target_label(self, task: Optional[str], state: dict) -> Optional[str]:
+        """Map a task description to a visible object label when possible."""
+        task_text = (task or "").lower()
+
+        aliases = {
+            "dining table": ("wood table", "wooden table", "table"),
+            "bottle": ("bottle",),
+            "chair": ("chair",),
+            "cup": ("cup",),
+            "book": ("book",),
+            "laptop": ("laptop",),
+            "person": ("person",),
+        }
+
+        for canonical, words in aliases.items():
+            if any(word in task_text for word in words):
+                return canonical
+
+        for obj in state.get("scene", {}).get("objects", []):
+            label = str(obj.get("label", "")).strip().lower()
+            if label and label in task_text:
+                return label
+
+        return None
+
+    def _is_object_visible(self, state: dict, label: str) -> bool:
+        """Return True when the target label appears in scene.objects."""
+        target = label.strip().lower()
+        for obj in state.get("scene", {}).get("objects", []):
+            if str(obj.get("label", "")).strip().lower() == target:
+                return True
+        return False
 
     def _build_messages(
         self,
