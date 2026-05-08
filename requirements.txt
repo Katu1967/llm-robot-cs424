@@ -3,3 +3,4 @@ numpy
 ollama
 Pillow
 python-dotenv
+ultralytics
