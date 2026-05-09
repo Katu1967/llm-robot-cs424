@@ -1,23 +1,18 @@
 """
-YOLOv3 object detection module.
+YOLOv8 object detection module.
 
 Provides a reusable YOLODetector class that can be imported by other scripts
 (e.g. nao_cam.py) to run detection on individual frames from any image source.
+Uses the Ultralytics YOLOv8 implementation.
 
 Model files required (place in src/models/):
-  - yolov3.cfg
-  - yolov3.weights
-  - coco.names
-
-Download links:
-  weights : https://pjreddie.com/media/files/yolov3.weights
-  cfg     : https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg
-  names   : https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names
+  - yolov8n.pt (or other YOLOv8 .pt files)
 """
 
 import os
 import cv2 as cv
 import numpy as np
+from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to this file so they work regardless of CWD)
@@ -28,41 +23,37 @@ DEFAULT_MODELS_DIR = os.path.join(_SRC_DIR, "models")
 
 class YOLODetector:
     """
-    Wraps YOLOv3 (via OpenCV DNN) for single-frame object detection.
+    Wraps YOLOv8 (via Ultralytics) for single-frame object detection.
 
     Parameters
     ----------
     models_dir : str
-        Directory containing yolov3.cfg, yolov3.weights, and coco.names.
+        Directory containing the .pt model file.
+    model_name : str
+        Name of the model file (default: yolov8n.pt).
     confidence_threshold : float
         Minimum detection confidence to keep (0–1).
-    nms_threshold : float
-        Non-maximum suppression overlap threshold (0–1).
-    input_size : tuple[int, int]
-        Network input resolution (width, height). Must be a multiple of 32.
     """
 
     def __init__(
         self,
         models_dir: str = DEFAULT_MODELS_DIR,
+        model_name: str = "yolov8n.pt",
         confidence_threshold: float = 0.5,
-        nms_threshold: float = 0.4,
-        input_size: tuple = (416, 416),
+        **kwargs,  # Accept extra args for backward compatibility
     ):
-        cfg_path     = os.path.join(models_dir, "yolov3.cfg")
-        weights_path = os.path.join(models_dir, "yolov3.weights")
-        names_path   = os.path.join(models_dir, "coco.names")
+        model_path = os.path.join(models_dir, model_name)
 
-        for path in (cfg_path, weights_path, names_path):
-            if not os.path.isfile(path):
-                raise FileNotFoundError(
-                    f"YOLO model file not found: {path}\n"
-                    "See the module docstring for download links."
-                )
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"YOLOv8 model file not found: {model_path}\n"
+                "Run 'make models' to download it."
+            )
 
-        # Load class names
-        with open(names_path) as f:
-            self.classes = f.read().strip().split("\n")
+        # Load the YOLOv8 model
+        self.model = YOLO(model_path)
+        self.classes = self.model.names  # dict of {id: name}
+        self.conf_thresh = confidence_threshold
 
         # Assign a fixed colour per class for consistent visualisation
         np.random.seed(42)
@@ -70,31 +61,13 @@ class YOLODetector:
             0, 255, size=(len(self.classes), 3), dtype="uint8"
         )
 
-        # Load network
-        self.net = cv.dnn.readNetFromDarknet(cfg_path, weights_path)
-        self.net.setPreferableBackend(cv.dnn.DNN_BACKEND_OPENCV)
-        self.net.setPreferableTarget(cv.dnn.DNN_TARGET_CPU)
-
-        # Identify output layers
-        all_layers = self.net.getLayerNames()
-        unconnected = self.net.getUnconnectedOutLayers()
-        # Handle both OpenCV 4.x (array of arrays) and 4.5.4+ (flat array)
-        if unconnected.ndim == 2:
-            self.output_layers = [all_layers[i[0] - 1] for i in unconnected]
-        else:
-            self.output_layers = [all_layers[i - 1] for i in unconnected]
-
-        self.conf_thresh = confidence_threshold
-        self.nms_thresh  = nms_threshold
-        self.input_size  = input_size
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def detect(self, bgr_frame: np.ndarray) -> list[dict]:
         """
-        Run YOLO detection on a single BGR frame.
+        Run YOLOv8 detection on a single BGR frame.
 
         Returns
         -------
@@ -105,48 +78,32 @@ class YOLODetector:
               'box'        : (x, y, w, h) in pixel coords
               'class_id'   : int
         """
-        h, w = bgr_frame.shape[:2]
-
-        blob = cv.dnn.blobFromImage(
-            bgr_frame, 1 / 255.0, self.input_size, swapRB=True, crop=False
-        )
-        self.net.setInput(blob)
-        outputs = self.net.forward(self.output_layers)
-
-        boxes, confidences, class_ids = [], [], []
-
-        for output in outputs:
-            for detection in output:
-                scores     = detection[5:]
-                class_id   = int(np.argmax(scores))
-                confidence = float(scores[class_id])
-
-                if confidence < self.conf_thresh:
-                    continue
-
-                cx, cy, bw, bh = detection[:4] * np.array([w, h, w, h])
-                x = int(cx - bw / 2)
-                y = int(cy - bh / 2)
-                boxes.append([x, y, int(bw), int(bh)])
-                confidences.append(confidence)
-                class_ids.append(class_id)
-
-        # Non-maximum suppression
-        indices = cv.dnn.NMSBoxes(
-            boxes, confidences, self.conf_thresh, self.nms_thresh
-        )
-
+        # Run inference
+        results = self.model(bgr_frame, conf=self.conf_thresh, verbose=False)
+        
         detections = []
-        if len(indices) > 0:
-            for i in indices.flatten():
-                detections.append(
-                    {
-                        "label":      self.classes[class_ids[i]],
-                        "confidence": confidences[i],
-                        "box":        tuple(boxes[i]),   # (x, y, w, h)
-                        "class_id":   class_ids[i],
-                    }
-                )
+        if not results:
+            return detections
+
+        # Process results (usually there's only one item in results for a single image)
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                # Extract coordinates (x1, y1, x2, y2)
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                w = x2 - x1
+                h = y2 - y1
+                
+                class_id = int(box.cls[0])
+                confidence = float(box.conf[0])
+                
+                detections.append({
+                    "label":      self.classes[class_id],
+                    "confidence": confidence,
+                    "box":        (int(x1), int(y1), int(w), int(h)),
+                    "class_id":   class_id,
+                })
+                
         return detections
 
     def annotate(self, bgr_frame: np.ndarray, detections: list[dict]) -> np.ndarray:
@@ -164,6 +121,7 @@ class YOLODetector:
             color = [int(c) for c in self.colors[det["class_id"]]]
             cv.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
             label = f"{det['label']}: {det['confidence']:.2f}"
+            
             # Draw a filled background rectangle behind the text for readability
             (text_w, text_h), baseline = cv.getTextSize(
                 label, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1
