@@ -1,15 +1,5 @@
 """
 PlanExecutor — NAO robot execution layer.
-
-Sits between the LLM planner and raw Webots motor control.
-Executes plans step-by-step, non-blocking, inside the Webots simulation loop.
-
-Design:
-  - Each action is a generator that yields control each timestep
-  - PlanExecutor drives the active action one tick at a time
-  - Actions can query the SceneBus for live vision feedback
-  - Plan caching prevents re-executing the same plan
-  - A simple state machine tracks: IDLE → RUNNING → DONE / FAILED
 """
 
 import time
@@ -22,97 +12,54 @@ from typing import Generator, Optional
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-#  State machine states
-# ─────────────────────────────────────────────
-
 class ExecutorState(Enum):
-    IDLE    = auto()   # No active plan
-    RUNNING = auto()   # Executing a step
-    PAUSED  = auto()   # Waiting (e.g. for sensor confirmation)
-    DONE    = auto()   # Plan complete
-    FAILED  = auto()   # Unrecoverable error
+    IDLE    = auto()
+    RUNNING = auto()
+    PAUSED  = auto()
+    DONE    = auto()
+    FAILED  = auto()
 
-
-# ─────────────────────────────────────────────
-#  PlanExecutor
-# ─────────────────────────────────────────────
 
 class PlanExecutor:
-    """
-    Drives plan execution one simulation tick at a time.
-
-    Usage inside Webots loop:
-        executor = PlanExecutor(robot_interface, scene_bus)
-
-        while robot.step(timestep) != -1:
-            # update perception / planning ...
-            if new_plan:
-                executor.load_plan(new_plan)
-            executor.tick()
-    """
-
     def __init__(self, robot_interface, scene_bus=None):
-        """
-        Args:
-            robot_interface: NaoInterface instance (wraps Webots motor APIs)
-            scene_bus:       SceneBus instance for live vision queries (optional)
-        """
-        self.robot   = robot_interface
-        self.bus     = scene_bus
-        self.state   = ExecutorState.IDLE
+        self.robot = robot_interface
+        self.bus   = scene_bus
+        self.state = ExecutorState.IDLE
 
-        self._plan:        list  = []          # List of step dicts from LLM
-        self._step_index:  int   = 0           # Which step we're on
-        self._active_gen:  Optional[Generator] = None   # Running action generator
-        self._plan_hash:   str   = ""          # Hash of current plan (for caching)
-        self._step_result: str   = "ok"        # "ok" | "failed"
+        self._plan:        list                 = []
+        self._step_index:  int                  = 0
+        self._active_gen:  Optional[Generator]  = None
+        self._plan_hash:   str                  = ""
+        self._step_result: str                  = "ok"
 
-        # Registry: action name → handler method
         self._handlers = {
-            # ── Primitive (motor-level) ──────────────────
-            "turn_left":       self._act_turn,
-            "turn_right":      self._act_turn,
-            "adjust_orientation":  self._act_turn, 
-            "move_forward":    self._act_move_forward,
-            "move_backward":   self._act_move_backward,
-            "stop":            self._act_stop,
-            "set_head_yaw":    self._act_set_head_yaw,
-            "set_head_pitch":  self._act_set_head_pitch,
-            "wave":            self._act_wave,
-            # ── Semantic (vision-guided) ─────────────────
-            "move_toward_object":  self._act_move_toward_object,
-            "center_on_object":    self._act_center_on_object,
-            "look_for_object":     self._act_look_for_object,
-            "pick_object":         self._act_pick_object,
-            "place_object":        self._act_place_object,
+            "turn_left":          self._act_turn,
+            "turn_right":         self._act_turn,
+            "adjust_orientation": self._act_turn,
+            "move_forward":       self._act_move_forward,
+            "move_backward":      self._act_move_backward,
+            "stop":               self._act_stop,
+            "set_head_yaw":       self._act_set_head_yaw,
+            "set_head_pitch":     self._act_set_head_pitch,
+            "wave":               self._act_wave,
+            "move_toward_object": self._act_move_toward_object,
+            "center_on_object":   self._act_center_on_object,
+            "look_for_object":    self._act_look_for_object,
+            "pick_object":        self._act_pick_object,
+            "place_object":       self._act_place_object,
         }
 
-    # ──────────────────────────────────────────
-    #  Public API
-    # ──────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def load_plan(self, plan_json: dict) -> bool:
-        """
-        Load a new plan.  Returns False if plan is identical to current one
-        (caching) or malformed.
-
-        Args:
-            plan_json: Full LLM output dict, e.g.:
-                {
-                  "plan": [
-                    {"step": 1, "action": "turn_left",  "parameters": {"degrees": 30}},
-                    {"step": 2, "action": "move_forward","parameters": {"meters": 1.0}},
-                  ]
-                }
-        """
         steps = plan_json.get("plan", [])
         if not steps:
             logger.warning("PlanExecutor: empty or missing 'plan' key — skipping")
             return False
 
         plan_hash = _hash_plan(steps)
-        # Skip reload only if plan is identical AND we are actively running it
         if plan_hash == self._plan_hash and self.state == ExecutorState.RUNNING:
             logger.debug("PlanExecutor: plan unchanged and still running — not reloading")
             return False
@@ -123,32 +70,28 @@ class PlanExecutor:
         self._plan_hash  = plan_hash
         self._active_gen = None
         self.state       = ExecutorState.RUNNING
-        self._advance()   # prime first action
+        self._advance()
         return True
 
     def tick(self):
-        """
-        Call once per Webots simulation step.
-        Advances the active action by one frame.
-        """
         if self.state != ExecutorState.RUNNING:
             return
-
         if self._active_gen is None:
             return
 
         try:
-            next(self._active_gen)              # advance action one frame
+            next(self._active_gen)
         except StopIteration as e:
             result = e.value if e.value else "ok"
             logger.debug(f"PlanExecutor: step {self._step_index} finished → {result}")
             self._on_step_done(result)
         except Exception as exc:
-            logger.error(f"PlanExecutor: step {self._step_index} raised {exc}")
+            import traceback
+            logger.error(f"PlanExecutor: step {self._step_index} raised: {exc}")
+            traceback.print_exc()
             self._on_step_done("failed")
 
     def reset(self):
-        """Abandon current plan and return to IDLE."""
         self._active_gen = None
         self._plan       = []
         self._step_index = 0
@@ -166,14 +109,13 @@ class PlanExecutor:
             return self._plan[self._step_index]
         return None
 
-    # ──────────────────────────────────────────
-    #  Internal step-machine helpers
-    # ──────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Step machine
+    # ------------------------------------------------------------------
 
     def _advance(self):
-        """Start the next step, or mark plan as DONE."""
         if self._step_index >= len(self._plan):
-            logger.info("PlanExecutor: plan complete ✓")
+            print("[PlanExecutor] ✓ Plan complete!")
             self.state = ExecutorState.DONE
             self.robot.stop_walk()
             return
@@ -182,11 +124,11 @@ class PlanExecutor:
         action = step.get("action", "").lower()
         params = step.get("parameters", {})
 
-        logger.info(f"PlanExecutor: step {self._step_index + 1}/{len(self._plan)} → {action} {params}")
+        print(f"[PlanExecutor] Step {self._step_index + 1}/{len(self._plan)}: {action} {params}")
 
         handler = self._handlers.get(action)
         if handler is None:
-            logger.warning(f"PlanExecutor: unknown action '{action}' — skipping")
+            print(f"[PlanExecutor] WARNING: unknown action '{action}' — skipping")
             self._on_step_done("skipped")
             return
 
@@ -194,48 +136,50 @@ class PlanExecutor:
 
     def _on_step_done(self, result: str):
         self._active_gen = None
+
         if result == "failed":
             self.state = ExecutorState.FAILED
-            logger.error(f"PlanExecutor: FAILED at step {self._step_index}")
+            print(f"[PlanExecutor] ✗ FAILED at step {self._step_index + 1}")
             return
+
         self._step_index += 1
         self._advance()
 
-    # ──────────────────────────────────────────
-    #  ── PRIMITIVE ACTIONS ────────────────────
-    #  Each is a generator: yields each frame, returns "ok"/"failed"
-    # ──────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Primitive actions
+    # ------------------------------------------------------------------
 
     def _act_turn(self, params: dict) -> Generator:
-        """
-        Turn in place by `degrees` (positive = left, negative = right).
-        For turn_right the sign is flipped automatically by checking the
-        action name stored in the current step.
-        """
         degrees = float(params.get("degrees", 30))
         action  = self.current_step.get("action", "turn_left")
-        if action == "turn_right":
-            degrees = -abs(degrees)
-        else:
-            degrees = abs(degrees)
 
-        duration_s  = abs(degrees) / 45.0      # ~45 °/s turn speed
-        frames      = max(1, int(duration_s / self.robot.timestep_s))
+        degrees = -abs(degrees) if action == "turn_right" else abs(degrees)
+
+        duration_s = abs(degrees) / 45.0
+        frames     = max(1, int(duration_s / self.robot.timestep_s))
+
+        print(f"[PlanExecutor] turn: {degrees:.1f}° over {duration_s:.1f}s ({frames} frames)")
 
         self.robot.start_turn(degrees)
+
         for _ in range(frames):
             yield
+
         self.robot.stop_walk()
         return "ok"
 
     def _act_move_forward(self, params: dict) -> Generator:
         meters = float(params.get("meters", params.get("distance_m", 0.5)))
-        speed      = 0.12                       # conservative NAO gait estimate
-        frames     = max(1, int(meters / speed / self.robot.timestep_s))
+        speed  = 0.12
+        frames = max(1, int(meters / speed / self.robot.timestep_s))
+
+        print(f"[PlanExecutor] move_forward: {meters}m ({frames} frames)")
 
         self.robot.start_walk(vx=speed, vy=0, omega=0)
+
         for _ in range(frames):
             yield
+
         self.robot.stop_walk()
         return "ok"
 
@@ -244,9 +188,13 @@ class PlanExecutor:
         speed  = 0.10
         frames = max(1, int(meters / speed / self.robot.timestep_s))
 
+        print(f"[PlanExecutor] move_backward: {meters}m ({frames} frames)")
+
         self.robot.start_walk(vx=-speed, vy=0, omega=0)
+
         for _ in range(frames):
             yield
+
         self.robot.stop_walk()
         return "ok"
 
@@ -256,12 +204,14 @@ class PlanExecutor:
         return "ok"
 
     def _act_set_head_yaw(self, params: dict) -> Generator:
-        angle  = float(params.get("angle", 0.0))      # radians
-        frames = int(1.0 / self.robot.timestep_s)      # ~1 s motion
+        angle  = float(params.get("angle", 0.0))
+        frames = int(1.0 / self.robot.timestep_s)
 
         self.robot.set_head_yaw(angle)
+
         for _ in range(frames):
             yield
+
         return "ok"
 
     def _act_set_head_pitch(self, params: dict) -> Generator:
@@ -269,213 +219,335 @@ class PlanExecutor:
         frames = int(1.0 / self.robot.timestep_s)
 
         self.robot.set_head_pitch(angle)
+
         for _ in range(frames):
             yield
+
         return "ok"
 
     def _act_wave(self, params: dict) -> Generator:
-        """Simple wave gesture using right shoulder/elbow joints."""
         import math
-        frames_per_cycle = int(0.5 / self.robot.timestep_s)   # 0.5 s per half-wave
+
+        frames_per_cycle = int(0.5 / self.robot.timestep_s)
         cycles = int(params.get("cycles", 2))
 
         for c in range(cycles * 2):
             angle = math.pi / 4 if c % 2 == 0 else 0.0
+
             self.robot.set_joint("RShoulderPitch", -angle)
             self.robot.set_joint("RShoulderRoll",   angle)
             self.robot.set_joint("RElbowRoll",      angle * 1.5)
+
             for _ in range(frames_per_cycle):
                 yield
 
-        # Return arm to rest
         self.robot.set_joint("RShoulderPitch", 1.4)
         self.robot.set_joint("RShoulderRoll", -0.3)
         self.robot.set_joint("RElbowRoll",     0.5)
+
         for _ in range(frames_per_cycle):
             yield
+
         return "ok"
 
-    # ──────────────────────────────────────────
-    #  ── SEMANTIC ACTIONS ─────────────────────
-    #  Vision-guided; use SceneBus for feedback
-    # ──────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Semantic actions
+    # ------------------------------------------------------------------
 
     def _act_center_on_object(self, params: dict) -> Generator:
-        """
-        Rotate head (and body if needed) until target object is centred
-        in the camera frame.
+        label     = params.get("label", "")
+        tolerance = float(params.get("tolerance", 0.10))
+        timeout_s = float(params.get("timeout_s", 5.0))
+        deadline  = time.time() + timeout_s
 
-        params:
-            label       – YOLO class name, e.g. "cup"
-            tolerance   – fraction of frame width to accept as "centred" (default 0.1)
-            timeout_s   – give up after this many seconds (default 5)
-        """
-        label      = params.get("label", "")
-        tolerance  = float(params.get("tolerance", 0.10))    # 10 % of frame
-        timeout_s  = float(params.get("timeout_s", 5.0))
-        deadline   = time.time() + timeout_s
-
-        logger.info(f"center_on_object: looking for '{label}'")
+        print(f"[PlanExecutor] center_on_object: '{label}'")
 
         while time.time() < deadline:
             obj = self._find_object(label)
+
             if obj is None:
-                logger.debug(f"center_on_object: '{label}' not visible — waiting")
                 yield
                 continue
 
-            cx_norm = obj["cx_norm"]    # 0 = left edge, 1 = right edge, 0.5 = centre
-            error   = cx_norm - 0.5     # negative → object left of centre
+            cx_norm = obj["cx_norm"]
+            error   = cx_norm - 0.5
 
             if abs(error) < tolerance:
-                logger.info(f"center_on_object: '{label}' centred ✓")
+                print(f"[PlanExecutor] center_on_object: '{label}' centred ✓")
                 return "ok"
 
-            # Proportional head yaw correction
-            correction = -error * 0.8   # radians, scaled
-            self.robot.adjust_head_yaw(correction)
+            head_yaw = self.robot.get_head_yaw()
+
+            if abs(head_yaw) > 1.5:
+                self.robot.start_turn(-20.0 if error > 0 else 20.0)
+            else:
+                self.robot.stop_walk()
+                self.robot.adjust_head_yaw(-error * 0.6)
+
             yield
 
-        logger.warning(f"center_on_object: timeout waiting for '{label}'")
+        print(f"[PlanExecutor] center_on_object: timeout for '{label}'")
         return "failed"
 
     def _act_move_toward_object(self, params: dict) -> Generator:
         """
-        Walk toward an object until its bounding-box height reaches
-        a threshold fraction of the frame (proxy for distance).
+        Walk toward an object using live YOLO + depth.
 
-        params:
-            label           – YOLO class name
-            target_height   – bbox height as fraction of frame when "close enough" (default 0.35)
-            timeout_s       – (default 10)
+        Important behavior:
+        - If the object is visible, keep trying even after timeout_s.
+        - Only fail from timeout if the object is no longer visible.
+        - Stop when RangeFinder/depth distance <= stop_distance_m.
         """
-        label         = params.get("label", "")
-        target_height = float(params.get("target_height", 0.35))
-        timeout_s     = float(params.get("timeout_s", 10.0))
-        deadline      = time.time() + timeout_s
-        tolerance     = 0.10   # centering tolerance
 
-        logger.info(f"move_toward_object: heading for '{label}'")
+        label           = params.get("label", "")
+        timeout_s       = float(params.get("timeout_s", 30.0))
+        stop_distance_m = float(params.get("stop_distance_m", 0.40))
+        deadline        = time.time() + timeout_s
 
-        while time.time() < deadline:
+        print(
+            f"[PlanExecutor] move_toward_object: '{label}' "
+            f"stop_distance={stop_distance_m}m timeout={timeout_s}s "
+            f"(timeout only fails if object is lost)"
+        )
+
+        lost_count   = 0
+        last_seen_cx = 0.5
+        last_seen_cy = 0.6
+        seen_once    = False
+        tick         = 0
+
+        while True:
+            tick += 1
             obj = self._find_object(label)
 
+            # ----------------------------------------------------------
+            # Object visible
+            # ----------------------------------------------------------
+            if obj is not None:
+                last_seen_cx = obj["cx_norm"]
+                last_seen_cy = obj["cy_norm"]
+                lost_count   = 0
+                seen_once    = True
+
+            # ----------------------------------------------------------
+            # Track head toward last known target position
+            # ----------------------------------------------------------
+            try:
+                self.robot.look_at_normalised(last_seen_cx, last_seen_cy)
+            except Exception:
+                pass
+
+            # ----------------------------------------------------------
+            # Debug print
+            # ----------------------------------------------------------
+            if tick % 30 == 0:
+                try:
+                    gps = self.robot.get_gps_position()
+                    gps_str = f" gps={gps}"
+                except Exception:
+                    gps_str = ""
+
+                time_left = deadline - time.time()
+
+                if obj is not None:
+                    print(
+                        f"[move_toward] tick={tick} "
+                        f"cx={obj['cx_norm']:.2f} "
+                        f"h={obj['h_norm']:.3f} "
+                        f"dist={obj.get('distance_m')} "
+                        f"stop={stop_distance_m} "
+                        f"lost={lost_count} "
+                        f"time_left={time_left:.1f}s"
+                        f"{gps_str}"
+                    )
+                else:
+                    print(
+                        f"[move_toward] tick={tick} "
+                        f"OBJECT NOT VISIBLE "
+                        f"lost_count={lost_count} "
+                        f"last_cx={last_seen_cx:.2f} "
+                        f"time_left={time_left:.1f}s"
+                        f"{gps_str}"
+                    )
+
+            # ----------------------------------------------------------
+            # If object is lost, search/recover.
+            # Only fail if timeout has passed AND object is still lost.
+            # ----------------------------------------------------------
             if obj is None:
-                # Object lost — stop and wait one tick
-                self.robot.stop_walk()
+                lost_count += 1
+
+                if time.time() >= deadline:
+                    self.robot.stop_walk()
+                    print(
+                        f"[move_toward] TIMEOUT for '{label}' after {timeout_s}s "
+                        f"— object is not visible"
+                    )
+                    return "failed"
+
+                if seen_once and lost_count > 15:
+                    turn_dir = 20.0 if last_seen_cx < 0.5 else -20.0
+                    self.robot.start_turn(turn_dir)
+                    print(
+                        f"[move_toward] lost — turning "
+                        f"{'left' if turn_dir > 0 else 'right'} to recover"
+                    )
+                else:
+                    self.robot.start_walk(vx=0.08, vy=0, omega=0)
+
                 yield
                 continue
 
-            cx_norm   = obj["cx_norm"]
-            box_h     = obj["h_norm"]     # 0→1 relative frame height
-            error     = cx_norm - 0.5
+            # ----------------------------------------------------------
+            # Object visible: do NOT fail just because timeout passed.
+            # Keep going until close enough.
+            # ----------------------------------------------------------
+            distance_m = obj.get("distance_m")
 
-            # Close enough?
-            if box_h >= target_height:
+            if distance_m is not None and distance_m <= stop_distance_m:
                 self.robot.stop_walk()
-                logger.info(f"move_toward_object: reached '{label}' ✓")
+                print(
+                    f"[move_toward] REACHED '{label}' "
+                    f"— distance={distance_m:.3f}m <= {stop_distance_m:.3f}m ✓"
+                )
                 return "ok"
 
-            # Steer while walking
-            omega = -error * 1.2    # yaw correction (rad/s)
-            self.robot.start_walk(vx=0.25, vy=0, omega=omega)
+            # ----------------------------------------------------------
+            # Steering control
+            # ----------------------------------------------------------
+            error = last_seen_cx - 0.5
+
+            # If object is pretty centered, walk forward.
+            # If it is off-center, turn in place first.
+            omega = -error * 1.0
+
+            self.robot.start_walk(vx=0.15, vy=0, omega=omega)
+
             yield
 
-        self.robot.stop_walk()
-        logger.warning(f"move_toward_object: timeout for '{label}'")
-        return "failed"
-
     def _act_look_for_object(self, params: dict) -> Generator:
-        """
-        Rotate in place scanning for a labelled object.
-
-        params:
-            label       – YOLO class name
-            timeout_s   – (default 8)
-        """
         label     = params.get("label", "")
-        timeout_s = float(params.get("timeout_s", 8.0))
+        timeout_s = float(params.get("timeout_s", 10.0))
         deadline  = time.time() + timeout_s
 
-        logger.info(f"look_for_object: scanning for '{label}'")
-        self.robot.start_turn(degrees=360)   # slow continuous rotation
+        print(f"[PlanExecutor] look_for_object: '{label}'")
+
+        self.robot.start_turn(degrees=360)
 
         while time.time() < deadline:
             obj = self._find_object(label)
+
             if obj is not None:
                 self.robot.stop_walk()
-                logger.info(f"look_for_object: found '{label}' ✓")
+                print(f"[PlanExecutor] look_for_object: found '{label}' ✓")
                 return "ok"
+
             yield
 
         self.robot.stop_walk()
-        logger.warning(f"look_for_object: '{label}' not found within timeout")
+        print(f"[PlanExecutor] look_for_object: '{label}' not found (timeout)")
         return "failed"
 
     def _act_pick_object(self, params: dict) -> Generator:
-        """
-        Simplified pick: lower torso + close right hand.
-        Assumes robot is already positioned close to the object.
-        Extend this with IK or Webots Motion objects for real grasping.
-        """
-        import math
         label = params.get("label", "")
-        logger.info(f"pick_object: attempting to grasp '{label}'")
+        print(f"[PlanExecutor] pick_object: grasping '{label}'")
 
-        settle_frames = int(0.5 / self.robot.timestep_s)
+        f = self.robot.timestep_s
 
-        # Lean forward slightly
-        self.robot.set_joint("LShoulderPitch",  1.8)
-        self.robot.set_joint("RShoulderPitch",  1.8)
-        self.robot.set_joint("LElbowRoll",     -1.0)
-        self.robot.set_joint("RElbowRoll",      1.0)
-        for _ in range(settle_frames * 2):
+        def frames(secs):
+            return max(1, int(secs / f))
+
+        # 1. Look down
+        self.robot.set_head_pitch(0.4)
+
+        for _ in range(frames(0.5)):
             yield
 
-        # Close hands
-        self.robot.set_joint("LHand", 0.0)
-        self.robot.set_joint("RHand", 0.0)
-        for _ in range(settle_frames):
+        # 2. Reach arms forward
+        self.robot.set_joint("LShoulderPitch",  1.5)
+        self.robot.set_joint("RShoulderPitch",  1.5)
+        self.robot.set_joint("LShoulderRoll",   0.1)
+        self.robot.set_joint("RShoulderRoll",  -0.1)
+        self.robot.set_joint("LElbowYaw",      -0.5)
+        self.robot.set_joint("RElbowYaw",       0.5)
+        self.robot.set_joint("LElbowRoll",     -0.3)
+        self.robot.set_joint("RElbowRoll",      0.3)
+
+        for _ in range(frames(0.6)):
             yield
 
-        logger.info("pick_object: grasp complete (simulated) ✓")
+        # 3. Crouch
+        self.robot.set_joint("LHipPitch",   -0.7)
+        self.robot.set_joint("RHipPitch",   -0.7)
+        self.robot.set_joint("LKneePitch",   1.2)
+        self.robot.set_joint("RKneePitch",   1.2)
+        self.robot.set_joint("LAnklePitch", -0.5)
+        self.robot.set_joint("RAnklePitch", -0.5)
+        self.robot.set_joint("LShoulderPitch",  1.9)
+        self.robot.set_joint("RShoulderPitch",  1.9)
+
+        for _ in range(frames(0.8)):
+            yield
+
+        # 4. Hold simulated grasp
+        print("[PlanExecutor] pick_object: grasping…")
+
+        for _ in range(frames(0.5)):
+            yield
+
+        # 5. Stand back up, carry position
+        self.robot.set_joint("LHipPitch",   -0.45)
+        self.robot.set_joint("RHipPitch",   -0.45)
+        self.robot.set_joint("LKneePitch",   0.87)
+        self.robot.set_joint("RKneePitch",   0.87)
+        self.robot.set_joint("LAnklePitch", -0.41)
+        self.robot.set_joint("RAnklePitch", -0.41)
+        self.robot.set_joint("LShoulderPitch",  1.2)
+        self.robot.set_joint("RShoulderPitch",  1.2)
+        self.robot.set_joint("LElbowRoll",     -0.8)
+        self.robot.set_joint("RElbowRoll",      0.8)
+        self.robot.set_head_pitch(0.0)
+
+        for _ in range(frames(1.0)):
+            yield
+
+        print("[PlanExecutor] pick_object: complete ✓")
         return "ok"
 
     def _act_place_object(self, params: dict) -> Generator:
-        """Open hand to release object."""
-        logger.info("place_object: releasing object")
-        settle_frames = int(0.5 / self.robot.timestep_s)
+        print("[PlanExecutor] place_object")
 
-        self.robot.set_joint("LHand", 1.0)
-        self.robot.set_joint("RHand", 1.0)
-        for _ in range(settle_frames):
+        f = self.robot.timestep_s
+
+        def frames(secs):
+            return max(1, int(secs / f))
+
+        self.robot.set_joint("LShoulderPitch",  1.7)
+        self.robot.set_joint("RShoulderPitch",  1.7)
+        self.robot.set_joint("LElbowRoll",     -0.3)
+        self.robot.set_joint("RElbowRoll",      0.3)
+
+        for _ in range(frames(0.6)):
             yield
 
-        # Return arms to rest
-        self.robot.set_joint("LShoulderPitch", 1.4)
-        self.robot.set_joint("RShoulderPitch", 1.4)
-        for _ in range(settle_frames):
+        self.robot.set_joint("LShoulderPitch",  1.4)
+        self.robot.set_joint("RShoulderPitch",  1.4)
+        self.robot.set_joint("LShoulderRoll",   0.3)
+        self.robot.set_joint("RShoulderRoll",  -0.3)
+        self.robot.set_joint("LElbowRoll",     -0.5)
+        self.robot.set_joint("RElbowRoll",      0.5)
+
+        for _ in range(frames(0.5)):
             yield
 
-        logger.info("place_object: done ✓")
+        print("[PlanExecutor] place_object: done ✓")
         return "ok"
 
-    # ──────────────────────────────────────────
-    #  Helpers
-    # ──────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _find_object(self, label: str) -> Optional[dict]:
-        """
-        Query SceneBus for the most-confident detection matching `label`.
-
-        Returns a dict with:
-            cx_norm  – horizontal centre 0..1
-            cy_norm  – vertical centre 0..1
-            w_norm   – width  0..1
-            h_norm   – height 0..1
-            confidence
-        or None if not found.
-        """
         if self.bus is None:
             return None
 
@@ -483,32 +555,87 @@ class PlanExecutor:
         if not scene:
             return None
 
-        detections = scene.get("detections", [])
-        matches = [d for d in detections if d.get("label", "").lower() == label.lower()]
+        if isinstance(scene.get("detections"), list):
+            raw_dets = scene.get("detections", [])
+        else:
+            raw_dets = scene.get("scene", {}).get("objects", [])
+
+        norm = []
+
+        for d in raw_dets:
+            lbl = d.get("label", "")
+            if not lbl:
+                continue
+
+            if "bounding_box" in d:
+                bb = d["bounding_box"]
+                x  = bb.get("x", 0)
+                y  = bb.get("y", 0)
+                w  = bb.get("width",  bb.get("w", 0))
+                h  = bb.get("height", bb.get("h", 0))
+            else:
+                x = d.get("x", 0)
+                y = d.get("y", 0)
+                w = d.get("w", d.get("width", 0))
+                h = d.get("h", d.get("height", 0))
+
+            # Prefer RangeFinder depth, fall back to old visual estimate.
+            distance_m = (
+                d.get("depth_distance_m")
+                if d.get("depth_distance_m") is not None
+                else d.get("estimated_distance_m")
+            )
+
+            norm.append({
+                "label":       lbl,
+                "x":           x,
+                "y":           y,
+                "w":           w,
+                "h":           h,
+                "confidence":  d.get("confidence", 0),
+                "bearing_deg": d.get("horizontal_angle_deg"),
+                "distance_m":  distance_m,
+                "screen_pos":  d.get("screen_position", {}),
+            })
+
+        matches = [d for d in norm if d["label"].lower() == label.lower()]
         if not matches:
             return None
 
-        # Pick highest-confidence match
-        best = max(matches, key=lambda d: d.get("confidence", 0))
+        best = max(matches, key=lambda d: d["confidence"])
 
-        # Normalise bounding box to 0..1 (expects keys x, y, w, h in pixels
-        # and frame_width / frame_height in scene state, or pre-normalised)
-        fw = scene.get("frame_width",  640)
-        fh = scene.get("frame_height", 480)
+        cam = scene.get("camera", {}) if isinstance(scene, dict) else {}
+        res = cam.get("resolution", {})
+
+        fw = res.get("width")  or scene.get("frame_width")  or 640
+        fh = res.get("height") or scene.get("frame_height") or 480
+
         x, y, w, h = best["x"], best["y"], best["w"], best["h"]
 
+        sp = best.get("screen_pos") or {}
+
+        cx_norm = (
+            sp.get("x_norm")
+            if sp.get("x_norm") is not None
+            else (x + w / 2) / fw
+        )
+
+        cy_norm = (
+            sp.get("y_norm")
+            if sp.get("y_norm") is not None
+            else (y + h / 2) / fh
+        )
+
         return {
-            "cx_norm":    (x + w / 2) / fw,
-            "cy_norm":    (y + h / 2) / fh,
-            "w_norm":     w / fw,
-            "h_norm":     h / fh,
-            "confidence": best.get("confidence", 0),
+            "cx_norm":     cx_norm,
+            "cy_norm":     cy_norm,
+            "w_norm":      w / fw,
+            "h_norm":      h / fh,
+            "confidence":  best["confidence"],
+            "bearing_deg": best.get("bearing_deg"),
+            "distance_m":  best.get("distance_m"),
         }
 
-
-# ─────────────────────────────────────────────
-#  Utility
-# ─────────────────────────────────────────────
 
 def _hash_plan(steps: list) -> str:
     raw = json.dumps(steps, sort_keys=True)

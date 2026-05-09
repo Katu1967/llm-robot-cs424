@@ -39,6 +39,7 @@ class SceneBus:
     def __init__(self):
         self._subscribers: dict[str, list[Callable]] = defaultdict(list)
         self._lock = threading.Lock()
+        self._latest: dict[str, tuple] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -74,8 +75,30 @@ class SceneBus:
             except Exception as exc:
                 print(f"[SceneBus] ERROR — subscriber {cb.__qualname__} "
                       f"raised on topic '{topic}': {exc}")
+        # Cache the most-recent payload for simple query access (e.g. by
+        # PlanExecutor) so subscribers can also query the last published
+        # scene state without needing to be called directly.
+        try:
+            # Store the raw args tuple and kwargs dict for the topic
+            self._latest[topic] = (args, kwargs)
+        except Exception:
+            pass
 
         return len(callbacks)
+
+    def get_latest(self, topic: str):
+        """Return the most-recent payload published to *topic*.
+
+        For compatibility with existing code this returns the first positional
+        argument if present (e.g. the `state` dict for "scene_state"), or
+        None if nothing has been published yet.
+        """
+        with self._lock:
+            val = self._latest.get(topic)
+        if not val:
+            return None
+        args, kwargs = val
+        return args[0] if args else None
 
     def topics(self) -> list[str]:
         """Return a list of topics that have at least one subscriber."""

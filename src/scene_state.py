@@ -20,6 +20,7 @@ import time
 import json
 import cv2
 import numpy as np
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -149,7 +150,8 @@ class SceneStateExtractor:
         self._gyro  = _safe_enable(robot, "gyro",          timestep)
         self._imu   = _safe_enable(robot, "inertial unit", timestep)
         self._gps   = _safe_enable(robot, "gps",           timestep)
-
+        self._rangefinder = _safe_enable(robot, "HeadRangeFinder", timestep)
+        print(f"[SceneState] RangeFinder={'✓' if self._rangefinder else '✗'}")
         # --- Sonar ---
         self._sonar: dict[str, object] = {}
         for name in SONAR_SENSORS:
@@ -196,7 +198,7 @@ class SceneStateExtractor:
         w = self._camera.getWidth()
         return w / (2.0 * math.tan(math.radians(NAO_HFOV_DEG / 2.0)))
 
-    def _estimate_distance(self, label: str, box_h_px: int) -> float | None:
+    def _estimate_distance(self, label: str, box_h_px: int) -> Optional[float]:
         """
         Estimate object distance in metres using the pinhole camera model.
             distance = (real_height * focal_length) / box_height_px
@@ -228,6 +230,36 @@ class SceneStateExtractor:
         w = self._camera.getWidth()
         fl = self._focal_length_px()
         return round(math.degrees(math.atan2(cx_px - w / 2.0, fl)), 1)
+    def _depth_for_box(self, x: int, y: int, w: int, h: int):
+        if self._rangefinder is None:
+            return None
+
+        try:
+            depth = np.array(self._rangefinder.getRangeImage(), dtype=np.float32)
+            rf_w = self._rangefinder.getWidth()
+            rf_h = self._rangefinder.getHeight()
+            depth = depth.reshape((rf_h, rf_w))
+
+            cam_w = self._camera.getWidth()
+            cam_h = self._camera.getHeight()
+
+            x1 = int(max(0, x / cam_w * rf_w))
+            y1 = int(max(0, y / cam_h * rf_h))
+            x2 = int(min(rf_w, (x + w) / cam_w * rf_w))
+            y2 = int(min(rf_h, (y + h) / cam_h * rf_h))
+
+            patch = depth[y1:y2, x1:x2]
+
+            valid = patch[np.isfinite(patch)]
+            valid = valid[(valid > 0.05) & (valid < 5.0)]
+
+            if valid.size == 0:
+                return None
+
+            return round(float(np.median(valid)), 3)
+
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Sensor read helpers
@@ -255,7 +287,7 @@ class SceneStateExtractor:
             "yaw_deg":   round(math.degrees(v[2]), 2),
         }
 
-    def _read_gps(self) -> dict | None:
+    def _read_gps(self) -> Optional[dict]:
         v = _safe_read(self._gps, "getValues")
         if v is None:
             return None
@@ -302,7 +334,8 @@ class SceneStateExtractor:
             cy = y + h // 2
 
             h_frac = h / cam_h if cam_h > 0 else 0.0
-            est_dist_m = self._estimate_distance(det["label"], h)
+            depth_dist_m = self._depth_for_box(x, y, w, h)
+            est_dist_m = depth_dist_m if depth_dist_m is not None else self._estimate_distance(det["label"], h)
 
             enriched.append({
                 "label":            det["label"],
@@ -318,6 +351,7 @@ class SceneStateExtractor:
                 "horizontal_angle_deg": self._screen_angle_deg(cx),
                 # Distance estimate
                 "estimated_distance_m":   est_dist_m,
+                "depth_distance_m": depth_dist_m,
                 "relative_distance":      self._distance_bucket(h_frac),
                 # Is the object roughly centred in frame?
                 "centred_in_frame": abs(cx - cam_w / 2) < cam_w * 0.15,

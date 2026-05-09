@@ -119,6 +119,9 @@ CRITICAL RULES:
     Use move_forward only when the target object is not visible or not detectable.
 - If the task mentions a visible object by a common name, resolve it to the COCO
     label first, then plan against that label.
+- Example pickup goals:
+    "pick up the cup" → center_on_object(cup), move_toward_object(cup), pick_object(cup)
+    "grab the bottle" → center_on_object(bottle), move_toward_object(bottle), pick_object(bottle)
 
 ## Scene State Fields (summary)
 - meta              : trigger reason, sim time, frame count, snapshot path
@@ -476,14 +479,8 @@ class TaskPlanner:
         guided_steps = [
             {
                 "step": 1,
-                "action": "center_on_object",
-                "parameters": {"label": target_label, "tolerance": 0.10, "timeout_s": 5},
-                "description": f"Center on the visible {target_label}.",
-            },
-            {
-                "step": 2,
                 "action": "move_toward_object",
-                "parameters": {"label": target_label, "target_height": 0.35, "timeout_s": 10},
+                "parameters": {"label": target_label, "target_height": 0.28, "timeout_s": 24},
                 "description": f"Move toward the visible {target_label}.",
             },
         ]
@@ -491,7 +488,7 @@ class TaskPlanner:
         if wants_grasp:
             guided_steps.append(
                 {
-                    "step": 3,
+                    "step": 2,
                     "action": "pick_object",
                     "parameters": {"label": target_label},
                     "description": f"Pick up the {target_label}.",
@@ -512,6 +509,7 @@ class TaskPlanner:
 
         aliases = {
             "dining table": ("wood table", "wooden table", "table"),
+            "couch": ("couch", "sofa"),
             "bottle": ("bottle",),
             "chair": ("chair",),
             "cup": ("cup",),
@@ -609,30 +607,73 @@ class TaskPlanner:
 
 
     def _stub_plan(self, task: Optional[str], state: dict) -> dict:
-        """Returns a placeholder plan when Ollama is unavailable."""
+        """Build a simple executable fallback plan when Ollama is unavailable."""
+        goal_text = (task or "").lower()
         objects = state.get("scene", {}).get("objects", [])
-        obj_names = [o["label"] for o in objects]
-        return {
-            "reasoning": (
-                f"[STUB — Ollama not connected] "
-                f"Task: '{task}'. "
-                f"Detected objects: {obj_names}. "
-                f"Make sure 'ollama serve' is running and '{self._model}' is pulled."
-            ),
-            "task_summary": task or "Unknown task",
-            "plan": [
+        obj_names = [str(o.get("label", "")).lower() for o in objects if o.get("label")]
+        target_label = self._infer_target_label(task, state)
+        visible_target = target_label if target_label and self._is_object_visible(state, target_label) else None
+
+        if visible_target:
+            plan = [
                 {
                     "step": 1,
-                    "action": "stub_action",
+                    "action": "move_toward_object",
+                    "parameters": {"label": visible_target, "target_height": 0.28, "timeout_s": 24},
+                    "description": f"Move toward the visible {visible_target}.",
+                },
+            ]
+            if any(word in goal_text for word in ("pick", "grab", "take", "lift", "collect")):
+                plan.append(
+                    {
+                        "step": 2,
+                        "action": "pick_object",
+                        "parameters": {"label": visible_target},
+                        "description": f"Pick up the {visible_target}.",
+                    }
+                )
+            summary = f"Move toward the visible {visible_target}."
+            reasoning = (
+                f"[FALLBACK — Ollama not connected] Task: '{task}'. "
+                f"Detected objects: {obj_names}. "
+                f"Using the visible target '{visible_target}' with supported executor actions."
+            )
+        else:
+            # Conservative blind motion so the robot still does something useful.
+            plan = [
+                {
+                    "step": 1,
+                    "action": "turn_left",
+                    "parameters": {"degrees": 20},
+                    "description": "Turn left to scan for the target.",
+                },
+                {
+                    "step": 2,
+                    "action": "move_forward",
+                    "parameters": {"meters": 0.5},
+                    "description": "Move forward a short distance toward the goal area.",
+                },
+                {
+                    "step": 3,
+                    "action": "stop",
                     "parameters": {},
-                    "description": (
-                        f"STUB: Run 'ollama pull {self._model}' then 'ollama serve'."
-                    ),
-                }
-            ],
+                    "description": "Stop and wait for the next scene update.",
+                },
+            ]
+            summary = task or "Unknown task"
+            reasoning = (
+                f"[FALLBACK — Ollama not connected] Task: '{task}'. "
+                f"Detected objects: {obj_names}. "
+                f"No visible target was found, so the robot will make a conservative blind approach."
+            )
+
+        return {
+            "reasoning": reasoning,
+            "task_summary": summary,
+            "plan": plan,
             "requires_clarification": False,
             "clarification_question": None,
-            "estimated_duration_s": 0,
+            "estimated_duration_s": 8,
         }
 
     def _print_plan(self, plan: dict, elapsed: float) -> None:
