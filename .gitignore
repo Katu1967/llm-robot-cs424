@@ -6,3 +6,4 @@ src/snapshots/
 # API keys
 .env
 .venv
+.venv_x86
