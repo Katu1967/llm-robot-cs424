@@ -13,8 +13,63 @@ import re
 import json
 import base64
 import threading
+import subprocess
+import sys
 from io import BytesIO
 from typing import Optional
+
+# Optional: load .env automatically if python-dotenv is installed
+try:
+    from dotenv import load_dotenv
+
+    _root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _env_path = os.path.join(_root_dir, ".env")
+    load_dotenv(_env_path, override=True)
+except ImportError:
+    pass  # python-dotenv not installed; rely on shell env vars
+
+
+def _add_virtualenv_site_packages() -> None:
+    """Make the controller process able to import packages installed in the venv.
+
+    Webots may launch this module with a Python interpreter that does not inherit
+    the venv's site-packages automatically, even if PYTHON_COMMAND points at the
+    venv Python. When that happens, google-genai is installed but still not visible.
+    """
+    candidates: list[str] = []
+
+    py_cmd = (os.getenv("PYTHON_COMMAND") or "").strip()
+    if py_cmd and os.path.exists(py_cmd):
+        try:
+            out = subprocess.check_output(
+                [py_cmd, "-c", "import site; print(site.getsitepackages()[0])"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            candidates.append(out.strip())
+        except Exception:
+            pass
+
+    venv_root = (os.getenv("VIRTUAL_ENV") or "").strip()
+    if venv_root:
+        candidates.extend(
+            [
+                os.path.join(
+                    venv_root,
+                    "lib",
+                    f"python{sys.version_info.major}.{sys.version_info.minor}",
+                    "site-packages",
+                ),
+                os.path.join(venv_root, "lib", "site-packages"),
+            ]
+        )
+
+    for path in candidates:
+        if path and os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
+
+
+_add_virtualenv_site_packages()
 
 try:
     from PIL import Image

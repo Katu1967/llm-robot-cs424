@@ -7,36 +7,32 @@ from simple_search import format_feedback_line
 
 class SimpleExecutor:
     """
-    locate_object: 360° spin + YOLO verify (FOUND / TIMEOUT).
-    move_to_object: approach then **creep** when the bbox is large enough; emits
-    SUPER_CLOSE when vision thresholds are met (target large and centered).
-
-    LLM primitives: move_forward, turn_degrees.
-
-    Controller also merges OBJECT_IN_VIEW from scene polling during SEARCH_MODE.
+    locate_object: 360° spin + YOLO verify.
+    move_to_object: approach target using YOLO + RangeFinder distance.
     """
 
-    SPIN_DURATION_S       = 15.0    # full rotation search budget
+    SPIN_DURATION_S       = 15.0
     POLL_INTERVAL_S       = 0.05
-    STUCK_THRESHOLD_S     = 2.0
+    STUCK_THRESHOLD_S     = 4.0
 
     MOVE_CHECKPOINT_S = float(os.getenv("SIMPLE_MOVE_CHECKPOINT_S", "8.0"))
 
     FORWARD_MPS = float(os.getenv("SIMPLE_FORWARD_MPS", "0.10"))
     TURN_DPS = float(os.getenv("SIMPLE_TURN_DPS", "50"))
     APPROACH_VX = float(os.getenv("SIMPLE_APPROACH_VX", "0.18"))
-    CREEP_VX = float(os.getenv("SIMPLE_CREEP_VX", "0.09"))
-    TURN_OMEGA = float(os.getenv("SIMPLE_TURN_OMEGA", "0.52"))
+    CREEP_VX = float(os.getenv("SIMPLE_CREEP_VX", "0.035"))
+    TURN_OMEGA = float(os.getenv("SIMPLE_TURN_OMEGA", "0.25"))
     MAX_PRIMITIVE_S = float(os.getenv("SIMPLE_MAX_PRIMITIVE_S", "30"))
     MIN_STEP_M = 0.05
     MAX_STEP_M = 2.5
 
-    # Final approach during move_to_object: slow creep until bbox is very large + centered.
     CREEP_ENTER_HF = float(os.getenv("SIMPLE_CREEP_ENTER_HF", "0.42"))
-    SUPER_CLOSE_HF = float(os.getenv("SIMPLE_SUPER_CLOSE_HF", "0.62"))
-    FINAL_CREEP_TIMEOUT_S = float(os.getenv("SIMPLE_FINAL_CREEP_TIMEOUT_S", "7.0"))
-    FORCE_SUPER_CLOSE_HF = float(os.getenv("SIMPLE_FORCE_SUPER_CLOSE_HF", "0.56"))
-    STOP_DISTANCE_M = float(os.getenv("SIMPLE_STOP_DISTANCE_M", "0.40"))
+    SUPER_CLOSE_HF = float(os.getenv("SIMPLE_SUPER_CLOSE_HF", "0.78"))
+    FINAL_CREEP_TIMEOUT_S = float(os.getenv("SIMPLE_FINAL_CREEP_TIMEOUT_S", "12.0"))
+    FORCE_SUPER_CLOSE_HF = float(os.getenv("SIMPLE_FORCE_SUPER_CLOSE_HF", "0.88"))
+
+    # Stop for pickup distance. With RangeFinder depth available, this is the main criterion.
+    SUPER_CLOSE_DISTANCE_M = float(os.getenv("SIMPLE_SUPER_CLOSE_DISTANCE_M", "0.30"))
 
     _follow_look_alpha = float(os.getenv("NAO_FOLLOW_LOOK_ALPHA", "0.22"))
     _follow_pitch_gain = float(os.getenv("NAO_FOLLOW_PITCH_GAIN", "0.62"))
@@ -47,7 +43,7 @@ class SimpleExecutor:
         self._bus        = bus
         self._on_status  = on_status
 
-        self._mode:       str   = "IDLE"   # LOCATE, VERIFY_LOCATE, MOVE, STEP_*, IDLE
+        self._mode:       str   = "IDLE"
         self._aliases:    list  = []
         self._elapsed:    float = 0.0
         self._last_poll:  float = 0.0
@@ -75,7 +71,6 @@ class SimpleExecutor:
         return self._mode == "IDLE"
 
     def start_locate(self, aliases: list) -> None:
-        """Spin ~360° while polling scene for target; FOUND after verify or TIMEOUT."""
         self._mode             = "LOCATE"
         self._aliases          = [a.lower().strip() for a in aliases]
         self._elapsed          = 0.0
@@ -98,7 +93,7 @@ class SimpleExecutor:
         self._final_creep_start = None
         print(
             f"[SimpleExecutor] Moving toward: {self._aliases} "
-            f"(checkpoints every {self.MOVE_CHECKPOINT_S:.0f}s)"
+            f"(pickup stop distance {self.SUPER_CLOSE_DISTANCE_M:.2f}m)"
         )
         self._robot.start_walk(vx=self.APPROACH_VX)
 
@@ -151,8 +146,6 @@ class SimpleExecutor:
             return abs(float(c) - 0.5)
         if pos == "center":
             return 0.0
-        if pos == "left":
-            return 0.20
         return 0.20
 
     def _horiz_centered(self, obj: dict, pos: str, tol: float) -> bool:
@@ -218,6 +211,22 @@ class SimpleExecutor:
 
             if not match:
                 self._stuck_timer += self.POLL_INTERVAL_S
+
+                # If we recently got close, do NOT spin-recover.
+                # The object is probably below the camera, so stop and look down.
+                if self._max_h_frac >= 0.45:
+                    self._robot.stop_walk()
+                    self._robot.set_head_pitch(0.48)
+
+                    if self._stuck_timer >= 4.0:
+                        self.stop()
+                        self._on_status(
+                            f"SUPER_CLOSE: {self._target_label or self._aliases} "
+                            f"(lost below camera after close approach) — assuming pickup range.",
+                            None,
+                        )
+                    return
+
                 if self._stuck_timer >= self.STUCK_THRESHOLD_S:
                     self.stop()
                     self._on_status(
@@ -235,6 +244,7 @@ class SimpleExecutor:
             pos = obj.get("position", "center")
             hf_obj = obj.get("height_frac")
             hf_val = float(hf_obj) if hf_obj is not None else _height_frac_from_bucket(dist)
+
             centered_loose = self._horiz_centered(obj, pos, 0.17)
             centered_tight = self._horiz_centered(obj, pos, 0.12)
 
@@ -249,43 +259,51 @@ class SimpleExecutor:
                 else 0.0
             )
 
+            # ----------------------------------------------------------
+            # IMPORTANT:
+            # If RangeFinder depth exists, ONLY distance can trigger SUPER_CLOSE.
+            # This prevents stopping too early just because the YOLO box is large.
+            # ----------------------------------------------------------
             super_close = False
-            if self._elapsed >= 0.35:
-                if hf_val >= 0.66 and self._horiz_centered(obj, pos, 0.22):
-                    super_close = True
-                elif hf_val >= self.SUPER_CLOSE_HF and centered_loose:
-                    super_close = True
-                elif hf_val >= 0.56 and dist == "very_near" and centered_tight:
-                    super_close = True
-                elif (
-                    self._final_creep_start is not None
-                    and creep_age >= self.FINAL_CREEP_TIMEOUT_S
-                    and hf_val >= self.FORCE_SUPER_CLOSE_HF
-                    and centered_loose
-                ):
-                    super_close = True
 
-            if real_dist is not None and centered_loose:
-                try:
-                    if float(real_dist) <= self.STOP_DISTANCE_M:
+            if self._elapsed >= 0.35:
+                if real_dist is not None:
+                    try:
+                        super_close = float(real_dist) <= self.SUPER_CLOSE_DISTANCE_M
+                    except (TypeError, ValueError):
+                        super_close = False
+                else:
+                    # Fallback only when depth is unavailable.
+                    if hf_val >= self.SUPER_CLOSE_HF and centered_loose:
                         super_close = True
-                except (TypeError, ValueError):
-                    pass
+                    elif hf_val >= self.FORCE_SUPER_CLOSE_HF and centered_loose:
+                        super_close = True
+                    elif (
+                        self._final_creep_start is not None
+                        and creep_age >= self.FINAL_CREEP_TIMEOUT_S
+                        and hf_val >= self.FORCE_SUPER_CLOSE_HF
+                        and centered_loose
+                    ):
+                        super_close = True
 
             if super_close:
                 self.stop()
-                dist_msg = f"distance_m={float(real_dist):.3f}m" if real_dist is not None else f"distance={dist}"
+                dist_msg = (
+                    f"distance_m={float(real_dist):.3f}m"
+                    if real_dist is not None
+                    else f"distance={dist}"
+                )
                 self._on_status(
                     f"SUPER_CLOSE: {lbl} (height_frac={hf_val:.2f}, {dist_msg}) "
-                    "— final approach threshold met.",
+                    "— pickup distance threshold met.",
                     obj,
                 )
                 return
 
             if pos == "left":
-                self._robot.start_walk(vx=0.0, omega=self.TURN_OMEGA)
+                self._robot.start_walk(vx=0.02, omega=self.TURN_OMEGA)
             elif pos == "right":
-                self._robot.start_walk(vx=0.0, omega=-self.TURN_OMEGA)
+                self._robot.start_walk(vx=0.02, omega=-self.TURN_OMEGA)
             else:
                 use_creep = hf_val >= self.CREEP_ENTER_HF and centered_loose
                 vx = self.CREEP_VX if use_creep else self.APPROACH_VX
@@ -296,6 +314,7 @@ class SimpleExecutor:
             if cx is None or cy is None:
                 cx = {"left": 0.32, "center": 0.5, "right": 0.68}.get(pos, 0.5)
                 cy = 0.65
+
             self._robot.look_at_normalised(
                 cx,
                 cy,
@@ -303,14 +322,17 @@ class SimpleExecutor:
                 pitch_gain=self._follow_pitch_gain,
                 floor_pitch_boost=self._follow_floor_boost,
             )
+
             cy_val = float(cy) if cy is not None else 0.5
             if cy_val >= 0.72 and (self._elapsed - self._last_floor_pitch_nudge) >= 0.35:
                 extra = min(0.09, 0.038 + (cy_val - 0.72) * 0.45)
                 self._robot.adjust_head_pitch(extra)
                 self._last_floor_pitch_nudge = self._elapsed
 
-            curr_h = float(obj.get("height_frac")) if obj.get("height_frac") is not None else _height_frac_from_bucket(
-                obj.get("distance", "far")
+            curr_h = (
+                float(obj.get("height_frac"))
+                if obj.get("height_frac") is not None
+                else _height_frac_from_bucket(obj.get("distance", "far"))
             )
 
             if curr_h > self._max_h_frac:
@@ -325,15 +347,22 @@ class SimpleExecutor:
                 hf_s = f"{hf}" if hf is not None else "?"
                 dist = obj.get("distance", "?")
                 pos = obj.get("position", "?")
+                real_dist_msg = (
+                    f" distance_m={float(real_dist):.3f}m"
+                    if real_dist is not None
+                    else ""
+                )
+
                 if self._stuck_timer >= self.STUCK_THRESHOLD_S:
                     self._on_status(
-                        f"STUCK: {lbl} | height_frac={hf_s} distance={dist} position={pos}",
+                        f"STUCK: {lbl} | height_frac={hf_s} distance={dist} "
+                        f"position={pos}{real_dist_msg}",
                         obj,
                     )
                 else:
                     self._on_status(
                         f"PROGRESS: Approaching {lbl} | height_frac={hf_s} "
-                        f"distance={dist} position={pos}",
+                        f"distance={dist} position={pos}{real_dist_msg}",
                         obj,
                     )
 
@@ -347,6 +376,7 @@ class SimpleExecutor:
     def _update_step_forward(self) -> None:
         self._prim_elapsed += self.POLL_INTERVAL_S
         done = False
+
         if self._step_start_xy is not None:
             pos = self._robot.get_gps_position()
             if pos is not None and len(pos) >= 2:
@@ -356,51 +386,63 @@ class SimpleExecutor:
                 )
                 if d >= self._step_target_m * 0.9:
                     done = True
+
         if not done and self._prim_elapsed >= self._step_time_budget:
             done = True
+
         if self._prim_elapsed >= self.MAX_PRIMITIVE_S:
             self.stop()
             self._emit_step_done(
                 f"STEP_ABORT: move_forward exceeded {self.MAX_PRIMITIVE_S:.0f}s",
             )
             return
+
         if done:
             self.stop()
             self._emit_step_done(f"STEP_DONE: move_forward ~{self._step_target_m:.2f}m")
 
     def _update_step_turn(self) -> None:
         self._prim_elapsed += self.POLL_INTERVAL_S
+
         if self._prim_elapsed >= self.MAX_PRIMITIVE_S:
             self.stop()
             self._emit_step_done(
                 f"STEP_ABORT: turn_degrees exceeded {self.MAX_PRIMITIVE_S:.0f}s",
             )
             return
+
         if self._prim_elapsed >= self._turn_time_budget:
             self.stop()
             self._emit_step_done(f"STEP_DONE: turn_degrees {self._turn_target_deg:+.0f}°")
 
     def _emit_step_done(self, base: str) -> None:
         scene = self._latest_scene()
+
         if self._feedback_aliases:
             fb = format_feedback_line(scene, self._feedback_aliases)
             self._on_status(f"{base}\n{fb}", None)
         else:
             self._on_status(base, None)
+
         self._feedback_aliases = None
 
     def _check_scene(self):
         scene = self._latest_scene()
         if not scene:
             return None
+
         objects = scene.get("objects", [])
+
         for obj in objects:
             lbl = obj.get("label", "").lower()
+
             if self._target_label and lbl != self._target_label:
                 continue
+
             for alias in self._aliases:
                 if alias in lbl or lbl in alias:
                     return lbl, obj
+
         return None
 
 

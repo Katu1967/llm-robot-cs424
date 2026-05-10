@@ -285,8 +285,8 @@ class NaoInterface:
         self._set("HeadYaw", angle)
 
     def set_head_pitch(self, angle: float):
-        # Wider range so we can look further down at floor-level targets (~±37°)
-        angle = max(-0.64, min(0.64, float(angle)))
+        # Webots NAO HeadPitch max is about 0.515 rad.
+        angle = max(-0.67, min(0.50, float(angle)))
         self._head_pitch = angle
         self._set("HeadPitch", angle)
 
@@ -311,26 +311,28 @@ class NaoInterface:
         pitch_gain: Optional[float] = None,
         floor_pitch_boost: Optional[float] = None,
     ):
-        """
-        Point head toward normalized image coords (0–1). x: left=0, right=1; y: top=0, bottom=1.
-        Low y = object high in frame (look up); high y = object low / on floor (look down).
-
-        ``pitch_gain`` scales vertical aiming (default 0.3; use ~0.55–0.75 when following ground objects).
-        ``floor_pitch_boost`` extra downward bias when cy_norm > 0.5 (rad, added to desired pitch).
-        """
         cx_norm = max(0.0, min(1.0, float(cx_norm)))
         cy_norm = max(0.0, min(1.0, float(cy_norm)))
 
-        desired_yaw = -((cx_norm - 0.5) * math.pi * 0.5)
-        pg = 0.3 if pitch_gain is None else max(0.05, float(pitch_gain))
-        desired_pitch = (cy_norm - 0.5) * math.pi * pg
-        if floor_pitch_boost and cy_norm > 0.5:
-            desired_pitch += float(floor_pitch_boost) * (cy_norm - 0.5) * 2.0
+        alpha = 0.12 if alpha is None else float(alpha)
+        pitch_gain = 0.35 if pitch_gain is None else float(pitch_gain)
+        floor_pitch_boost = 0.04 if floor_pitch_boost is None else float(floor_pitch_boost)
 
-        a = 0.08 if alpha is None else max(0.01, min(1.0, float(alpha)))
+        # Left/right tracking
+        desired_yaw = -((cx_norm - 0.5) * math.pi * 0.45)
 
-        new_yaw = self._head_yaw + a * (desired_yaw - self._head_yaw)
-        new_pitch = self._head_pitch + a * (desired_pitch - self._head_pitch)
+        # Down/up tracking. Positive pitch looks down.
+        desired_pitch = (cy_norm - 0.5) * pitch_gain
+
+        # If object is low in frame, look slightly farther down.
+        if cy_norm > 0.65:
+            desired_pitch += floor_pitch_boost
+
+        new_yaw = self._head_yaw + alpha * (desired_yaw - self._head_yaw)
+        new_pitch = self._head_pitch + alpha * (desired_pitch - self._head_pitch)
+
+        # HARD clamp to Webots NAO safe head pitch range.
+        new_pitch = max(-0.67, min(0.50, new_pitch))
 
         self.set_head_yaw(new_yaw)
         self.set_head_pitch(new_pitch)

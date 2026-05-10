@@ -43,7 +43,7 @@ run: models
 ## simple       — launch the new simple single-tool controller
 simple: models
 	@echo ">>> Starting NAO Simple controller (robot=$(ROBOT_NAME), port=$(PORT))…"
-	$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) src/simple_controller.py
+	PATH="$(CURDIR)/.venv_x86/bin:$$PATH" SIMPLE_PLANNER_BACKEND=gemini GEMINI_MODEL=$(GEMINI_MODEL) $(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) run_simple_controller.py
 
 # ---------------------------------------------------------------------------
 ## models      — download YOLO model files into src/models/ (skips if present)
