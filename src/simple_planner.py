@@ -53,8 +53,7 @@ ALLOWED ACTIONS (exact "action" string):
   One straight segment per response. After locate_object for nav goals.
 - "turn_degrees": Field "degrees" (required number). POSITIVE = turn left, NEGATIVE = turn right.
 - "move_to_object": Field "aliases" (required). Vision + **RangeFinder depth** guided walk. Use ONLY after
-  "OBJECT_IN_VIEW:" and/or "FOUND:" in CURRENT CONTEXT. The robot aims to get within about **2 feet (~0.61 m)** of the
-  target when depth ``distance_m`` is reliable and the target is roughly centered (**SUPER_CLOSE:**). **Head pitch is
+  "OBJECT_IN_VIEW:" and/or "FOUND:" in CURRENT CONTEXT. The robot aims to get within about **0.21 m** of the target when depth distance_m is reliable and the target is roughly centered (**SUPER_CLOSE:**). **Head pitch is
   not an LLM action** — during approach the controller tilts the head **only** from the target's **vertical position in
   the image** (above/below center); head yaw stays **0**. While walking, you will receive **APPROACH_CHECKPOINT:** about
   every **10 seconds** (feet paused, head still tracking vertically, sonar + depth in context). On a checkpoint: return
@@ -97,7 +96,7 @@ STRICT RULES:
 4. For approach goals, **move_to_object** ends automatically on **SUPER_CLOSE** (~2 ft / ~0.61 m depth when centered, or large bbox).
   On **APPROACH_CHECKPOINT**, prefer **move_to_object** with unchanged aliases if the path is clear; otherwise dodge
   (short **move_forward** ≤0.5 m, **turn_degrees**). Use **done** for non-approach goals.
-5. For **go to / approach** goals, plan until the robot is within about **2 feet** of the target (**distance_m** toward ~**0.61 m** when centered); that is the success band for SUPER_CLOSE.
+5. For **go to / approach** goals, plan until the robot is within about **0.21 m** of the target; NEVER return "done" during move_to_object unless abandoning the task, let SUPER_CLOSE end it automatically.
 6. Follow PASSING PARAMETERS exactly.
 
 JSON EXAMPLES:
@@ -276,9 +275,9 @@ That starts a **360° spin** (head **neutral / level**) plus detection; watch fo
 After the spin, explore with **move_forward** and **turn_degrees** (one tool per step). **look_up** and **look_down**
 are **not supported** — head stays neutral until approach; then pitch follows the target vertically only.
 Then move_to_object after the target is confirmed visible. While approaching, respond to **APPROACH_CHECKPOINT:**
-(continue with same **move_to_object** aliases, or dodge with move/turn only). Goal: reach within about **2 ft (~0.61 m)** RangeFinder depth when centered.
+(continue with same **move_to_object** aliases, or dodge with move/turn only). Goal: reach within about **0.21 m** RangeFinder depth when centered.
 Always pass the required JSON fields for each tool (see system prompt). Prefer **0.55–0.9 m** for move_forward when exploring.
-Use "done" when the goal is met **without** relying on SUPER_CLOSE (e.g. inspection-only goals). For go-to-object, use move_to_object and let depth / bbox + SUPER_CLOSE finish when within ~**2 ft** (~0.61 m).
+Use "done" when the goal is met **without** relying on SUPER_CLOSE (e.g. inspection-only goals). For go-to-object, always return move_to_object to continue the approach and let the automatic SUPER_CLOSE finish the job when distance_m <= 0.21 m.
 
 What is your next action? Respond in JSON only."""
 

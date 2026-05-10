@@ -41,7 +41,7 @@ class SimpleExecutor:
     FINAL_CREEP_TIMEOUT_S = float(os.getenv("SIMPLE_FINAL_CREEP_TIMEOUT_S", "7.0"))
     FORCE_SUPER_CLOSE_HF = float(os.getenv("SIMPLE_FORCE_SUPER_CLOSE_HF", "0.56"))
     # ~2 feet (0.6096 m) — RangeFinder depth at bbox when roughly centered ends approach.
-    STOP_DISTANCE_M = float(os.getenv("SIMPLE_STOP_DISTANCE_M", "0.610"))
+    STOP_DISTANCE_M = float(os.getenv("SIMPLE_STOP_DISTANCE_M", "0.210"))
 
     # Lower alpha / gain = smoother pitch; bbox cy jitters less on the motors.
     _follow_look_alpha = float(os.getenv("NAO_FOLLOW_LOOK_ALPHA", "0.14"))
@@ -65,6 +65,7 @@ class SimpleExecutor:
         self._max_h_frac:       float         = 0.0
         self._stuck_timer:      float         = 0.0
         self._checkpoint_timer: float         = 0.0
+        self._recovery_timer:   float         = 0.0
 
         self._prim_elapsed:       float = 0.0
         self._step_target_m:      float = 0.0
@@ -75,11 +76,15 @@ class SimpleExecutor:
         self._feedback_aliases: Optional[List[str]] = None
         self._final_creep_start: Optional[float] = None
         self._replan_pause: bool = False
+        self._last_known_dist_m = None
         self._last_follow_cx: Optional[float] = None
         self._last_follow_cy: Optional[float] = None
         self._last_follow_pos: str = "center"
         self._last_follow_valid: bool = False
         self._step_track_head: bool = False
+        self._last_known_dist_m: Optional[float] = None   # <--- ADD THIS
+        self._blind_move_timer: float = 0.0               # <--- ADD THIS
+        self._blind_move_budget: float = 0.0
 
     @property
     def is_idle(self) -> bool:
@@ -129,6 +134,7 @@ class SimpleExecutor:
         self._elapsed          = 0.0
         self._checkpoint_timer = 0.0
         self._stuck_timer      = 0.0
+        self._recovery_timer   = 0.0
         self._max_h_frac       = 0.0
         self._target_label     = None
         self._feedback_aliases = None
@@ -340,11 +346,10 @@ class SimpleExecutor:
                         }
                     )
                 if self._stuck_timer >= self.STUCK_THRESHOLD_S:
-                    self.stop()
-                    self._on_status(
-                        f"LOST: Target {self._target_label or self._aliases} disappeared",
-                        None,
-                    )
+                    print(f"[SimpleExecutor] Target lost. Initiating vertical look recovery...")
+                    self._robot.stop_locomotion_only()
+                    self._mode = "RECOVERY_LOOK"   # <--- Transition to our new state
+                    self._recovery_timer = 0.0
                 return
 
             lbl, obj = match
@@ -356,6 +361,11 @@ class SimpleExecutor:
             dist = obj.get("distance", "far")
             real_dist = obj.get("distance_m")
             pos = obj.get("position", "center")
+            if real_dist is not None:
+                try:
+                    self._last_known_dist_m = float(real_dist)
+                except (TypeError, ValueError):
+                    pass
             hf_obj = obj.get("height_frac")
             hf_val = float(hf_obj) if hf_obj is not None else _height_frac_from_bucket(dist)
             centered_loose = self._horiz_centered(obj, pos, 0.17)
@@ -461,7 +471,7 @@ class SimpleExecutor:
                     f"APPROACH_CHECKPOINT: Feet paused (head still tracking). Approaching '{lbl}'. "
                     f"{dm_p}, height_frac={obj.get('height_frac')}, bbox position={pos}. "
                     f"Sonar left_m={left}, right_m={right}. "
-                    "Goal: stay within ~2 ft (~0.61 m) depth when centered. "
+                    f"Goal: approach until distance_m <= {self.STOP_DISTANCE_M:.2f} m. "
                     "Return **move_to_object** with the **same aliases** to continue, "
                     "or **turn_degrees** / **move_forward** (small) to dodge. "
                     "Head pitch follows the target vertically automatically (not LLM) — one action per response.",
@@ -480,6 +490,72 @@ class SimpleExecutor:
                 use_creep = hf_val >= self.CREEP_ENTER_HF and centered_loose
                 vx = self.CREEP_VX if use_creep else self.APPROACH_VX
                 self._robot.start_walk(vx=vx, omega=0.0)
+
+        elif self._mode == "RECOVERY_LOOK":
+            
+            self._recovery_timer += self.POLL_INTERVAL_S
+            
+            # 1. Did the object come back into view during the sweep?
+            if match:
+                lbl, obj = match
+                print(f"[SimpleExecutor] Target '{lbl}' re-acquired during sweep! Resuming approach.")
+                self._target_label = lbl
+                self._stuck_timer = 0.0
+                self._mode = "MOVE"
+                self._remember_follow_target(obj)
+                self._robot.start_walk(vx=self.APPROACH_VX)
+                return
+            
+            # 2. Perform the vertical head sweep over ~4.5 seconds
+            if self._recovery_timer < 1.5:
+                # Look UP
+                self._robot.set_head_pitch(-0.4) 
+            elif self._recovery_timer < 3.5:
+                # Look DOWN
+                self._robot.set_head_pitch(0.5)  
+            elif self._recovery_timer < 4.5:
+                # Return to NEUTRAL
+                self._robot.set_head_pitch(0.0)  
+            else:
+                # 3. Sweep failed. Did we lose it while close?
+                if self._last_known_dist_m is not None and self._last_known_dist_m < 1.5:
+                    # Calculate remaining distance to our 0.21m goal
+                    remaining_dist = max(0.0, self._last_known_dist_m - self.STOP_DISTANCE_M)
+                    self._blind_move_budget = remaining_dist / max(self.APPROACH_VX, 0.01)
+                    
+                    print(f"[SimpleExecutor] Sweep failed, but last known distance was {self._last_known_dist_m:.2f}m. Initiating blind approach for {remaining_dist:.2f}m (~{self._blind_move_budget:.1f}s).")
+                    
+                    self._robot.reset_head_neutral()
+                    self._robot.start_walk(vx=self.APPROACH_VX)
+                    self._mode = "BLIND_APPROACH"
+                    self._blind_move_timer = 0.0
+                else:
+                    self.stop()
+                    self._on_status(
+                        f"LOST: Target {self._target_label or self._aliases} disappeared",
+                        None,
+                    )
+        elif self._mode == "BLIND_APPROACH":
+            self._blind_move_timer += self.POLL_INTERVAL_S
+            
+            # If the object magically re-enters the camera frame, snap back to normal MOVE!
+            if match:
+                lbl, obj = match
+                print(f"[SimpleExecutor] Target '{lbl}' re-acquired during blind approach! Resuming normal tracking.")
+                self._target_label = lbl
+                self._stuck_timer = 0.0
+                self._mode = "MOVE"
+                self._remember_follow_target(obj)
+                self._robot.start_walk(vx=self.APPROACH_VX)
+                return
+            
+            # Otherwise, keep walking blindly until we cover the calculated remaining distance
+            if self._blind_move_timer >= self._blind_move_budget:
+                self.stop()
+                self._on_status(
+                    f"SUPER_CLOSE: {self._target_label or self._aliases} (Blind approach complete) — final approach threshold met.",
+                    None,
+                )
 
     def _latest_scene(self) -> Optional[dict]:
         latest = self._bus.get_latest("scene_state") if self._bus else None

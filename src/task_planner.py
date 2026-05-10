@@ -104,7 +104,7 @@ Primitive:
 Semantic (use when objects are detected):
   look_for_object      { "label": "<coco_name>", "timeout_s": <number> }
   center_on_object     { "label": "<coco_name>", "tolerance": 0.1, "timeout_s": 5 }
-  move_toward_object   { "label": "<coco_name>", "stop_distance_m": 0.40, "timeout_s": 24 }
+    move_toward_object   { "label": "<coco_name>", "stop_distance_m": 0.45, "timeout_s": 24 }
   pick_object          { "label": "<coco_name>" }
   place_object         {}
 

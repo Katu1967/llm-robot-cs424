@@ -301,7 +301,7 @@ class PlanExecutor:
 
         label           = params.get("label", "")
         timeout_s       = float(params.get("timeout_s", 30.0))
-        stop_distance_m = float(params.get("stop_distance_m", 0.40))
+        stop_distance_m = float(params.get("stop_distance_m", 0.45))
         deadline        = time.time() + timeout_s
 
         print(
@@ -402,13 +402,24 @@ class PlanExecutor:
             # Object visible: do NOT fail just because timeout passed.
             # Keep going until close enough.
             # ----------------------------------------------------------
-            distance_m = obj.get("distance_m")
+            distance_m = obj.get("distance_m") or obj.get("depth_distance_m")
 
             if distance_m is not None and distance_m <= stop_distance_m:
                 self.robot.stop_walk()
                 print(
                     f"[move_toward] REACHED '{label}' "
-                    f"— distance={distance_m:.3f}m <= {stop_distance_m:.3f}m ✓"
+                    f"— distance_m={distance_m:.3f}m <= {stop_distance_m:.3f}m ✓"
+                )
+                return "ok"
+
+            # Fallback: if depth is unavailable, only use the visual size when it
+            # is genuinely large enough to indicate close range.
+            box_h = float(obj.get("h_norm", obj.get("height_frac", 0.0)))
+            if distance_m is None and box_h >= 0.60:
+                self.robot.stop_walk()
+                print(
+                    f"[move_toward] REACHED '{label}' "
+                    f"— h={box_h:.3f} >= 0.60 (no depth) ✓"
                 )
                 return "ok"
 
