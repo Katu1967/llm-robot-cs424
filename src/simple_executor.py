@@ -521,7 +521,10 @@ class SimpleExecutor:
                 if self._last_known_dist_m is not None and self._last_known_dist_m < 1.5:
                     # Calculate remaining distance to our 0.21m goal
                     remaining_dist = max(0.0, self._last_known_dist_m - self.STOP_DISTANCE_M)
-                    self._blind_move_budget = remaining_dist / max(self.APPROACH_VX, 0.01)
+                    # Math assumes instant top speed. Add a 1.5x multiplier for startup 
+                    # friction, and force a minimum of 1.5 seconds so it actually steps.
+                    base_time = remaining_dist / max(self.APPROACH_VX, 0.01)
+                    self._blind_move_budget = max(1.5, base_time * 1.5)
                     
                     print(f"[SimpleExecutor] Sweep failed, but last known distance was {self._last_known_dist_m:.2f}m. Initiating blind approach for {remaining_dist:.2f}m (~{self._blind_move_budget:.1f}s).")
                     
