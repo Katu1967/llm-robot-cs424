@@ -55,6 +55,11 @@ class NaoInterface:
 
         self._head_yaw = 0.0
         self._head_pitch = 0.0
+        # Skip tiny setPosition deltas to reduce head jitter (rad).
+        self._head_cmd_min = float(os.getenv("NAO_HEAD_CMD_MIN_RAD", "0.012"))
+        # HeadPitch joint limits from Webots (avoid "too big requested position" warnings).
+        self._head_pitch_min = -0.67
+        self._head_pitch_max = 0.51
 
         self._motors = {}
         for name in NAO_JOINTS:
@@ -66,6 +71,12 @@ class NaoInterface:
                         motor.setVelocity(motor.getMaxVelocity())
                     except Exception:
                         pass
+                    if name == "HeadPitch":
+                        try:
+                            self._head_pitch_min = float(motor.getMinPosition())
+                            self._head_pitch_max = float(motor.getMaxPosition())
+                        except Exception:
+                            pass
                     if name in REST_POSE:
                         motor.setPosition(REST_POSE[name])
             except Exception as exc:
@@ -87,7 +98,8 @@ class NaoInterface:
 
         print(
             f"[NaoInterface] ready — {len(self._motors)} joints, "
-            f"{len(self._motions)} motion files"
+            f"{len(self._motions)} motion files "
+            f"(HeadPitch clamp [{self._head_pitch_min:.3f}, {self._head_pitch_max:.3f}] rad)"
         )
 
     # ------------------------------------------------------------------
@@ -254,16 +266,18 @@ class NaoInterface:
         else:
             self._play_motion("turn_right", loop=True)
 
-    def stop_walk(self):
+    def stop_locomotion_only(self):
+        """Stop walk/turn motions only — no Stand / go_to_rest (keeps head pose)."""
         if self._active_motion is not None:
             try:
                 self._active_motion.stop()
             except Exception:
                 pass
-
         self._active_motion = None
         self._active_motion_key = None
 
+    def stop_walk(self):
+        self.stop_locomotion_only()
         if "stand" in self._motions:
             try:
                 self._motions["stand"].setLoop(False)
@@ -279,14 +293,25 @@ class NaoInterface:
     # Head control
     # ------------------------------------------------------------------
 
+    def reset_head_neutral(self):
+        """Head straight ahead / level — use during search before the target is confirmed."""
+        self.set_head_yaw(0.0)
+        self.set_head_pitch(0.0)
+
     def set_head_yaw(self, angle: float):
         angle = max(-2.08, min(2.08, float(angle)))
+        if abs(angle - self._head_yaw) < self._head_cmd_min:
+            self._head_yaw = angle
+            return
         self._head_yaw = angle
         self._set("HeadYaw", angle)
 
     def set_head_pitch(self, angle: float):
-        # Wider range so we can look further down at floor-level targets (~±37°)
-        angle = max(-0.64, min(0.64, float(angle)))
+        mn, mx = self._head_pitch_min, self._head_pitch_max
+        angle = max(mn, min(mx, float(angle)))
+        if abs(angle - self._head_pitch) < self._head_cmd_min:
+            self._head_pitch = angle
+            return
         self._head_pitch = angle
         self._set("HeadPitch", angle)
 
@@ -302,6 +327,34 @@ class NaoInterface:
 
     def get_head_yaw(self) -> float:
         return self._head_yaw
+
+    def look_pitch_from_cy_norm(
+        self,
+        cy_norm: float,
+        alpha: Optional[float] = None,
+        pitch_gain: Optional[float] = None,
+        cy_deadband: Optional[float] = None,
+    ) -> None:
+        """
+        Adjust head **pitch only** from vertical image position (0=top, 1=bottom).
+        Yaw is unchanged. When ``cy_norm`` is within ``cy_deadband`` of image center (0.5),
+        target pitch is level (0 rad). Pitch is clamped to HeadPitch joint limits.
+        """
+        cy_norm = max(0.0, min(1.0, float(cy_norm)))
+        db = 0.04 if cy_deadband is None else max(0.0, float(cy_deadband))
+        pg = 0.3 if pitch_gain is None else max(0.05, float(pitch_gain))
+        if abs(cy_norm - 0.5) <= db:
+            desired_pitch = 0.0
+        else:
+            desired_pitch = (cy_norm - 0.5) * math.pi * pg
+
+        mn, mx = self._head_pitch_min, self._head_pitch_max
+        desired_pitch = max(mn, min(mx, desired_pitch))
+
+        a = 0.08 if alpha is None else max(0.01, min(1.0, float(alpha)))
+        new_pitch = self._head_pitch + a * (desired_pitch - self._head_pitch)
+        new_pitch = max(mn, min(mx, new_pitch))
+        self.set_head_pitch(new_pitch)
 
     def look_at_normalised(
         self,
@@ -327,10 +380,14 @@ class NaoInterface:
         if floor_pitch_boost and cy_norm > 0.5:
             desired_pitch += float(floor_pitch_boost) * (cy_norm - 0.5) * 2.0
 
+        mn, mx = self._head_pitch_min, self._head_pitch_max
+        desired_pitch = max(mn, min(mx, desired_pitch))
+
         a = 0.08 if alpha is None else max(0.01, min(1.0, float(alpha)))
 
         new_yaw = self._head_yaw + a * (desired_yaw - self._head_yaw)
         new_pitch = self._head_pitch + a * (desired_pitch - self._head_pitch)
+        new_pitch = max(mn, min(mx, new_pitch))
 
         self.set_head_yaw(new_yaw)
         self.set_head_pitch(new_pitch)

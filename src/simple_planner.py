@@ -2,7 +2,14 @@
 simple_planner.py — LLM planner for the simple controller stack.
 
 The LLM chooses actions: locate_object (spin search + SEARCH_MODE), move_forward,
-turn_degrees, look_up, look_down (emphasized for floor-level targets), move_to_object, done, fail, clarify.
+turn_degrees, move_to_object, done, fail, clarify. **Head pitch is not an LLM tool** — during approach the controller
+adjusts pitch only from the target's vertical position in the image (above/below center); yaw stays neutral.
+
+During **locate_object** spin and **SEARCH_MODE** before FOUND, the runtime keeps the head **neutral** so YOLO scans
+at a normal horizon.
+
+During ``move_to_object``, the executor may emit **APPROACH_CHECKPOINT** (~10 s): feet pause (no Stand); head pitch
+still tracks the target vertically; the LLM should continue with the same ``move_to_object`` aliases or issue a short dodge.
 
 After ``locate_object`` the executor spins ~360° while the controller still polls
 YOLO and may inject ``OBJECT_IN_VIEW`` into context before the spin finishes.
@@ -14,7 +21,7 @@ import json
 import base64
 import threading
 from io import BytesIO
-from typing import Optional
+from typing import List, Optional
 
 try:
     from PIL import Image
@@ -37,61 +44,159 @@ You MUST pass valid tool parameters in every JSON response (see PASSING PARAMETE
 
 ALLOWED ACTIONS (exact "action" string):
 - "locate_object": Navigation / search goals — REQUIRED FIRST. Fields: "aliases" (required): non-empty list of
-  strings (YOLO/COCO names and synonyms, e.g. ["dog","puppy"]). The robot performs a **360° spin** while checking
-  detections; you may then get "FOUND: …" after a stable sighting, or "TIMEOUT: …" if nothing matched. While
-  spinning, context may also include "OBJECT_IN_VIEW:" when YOLO sees the target in the current frame.
+  strings (YOLO/COCO names and synonyms, e.g. ["dog","puppy"]). The robot performs a **360° spin** with **head level
+  (neutral)** while checking detections; the spin sweeps the room. You may then get "FOUND: …" after a stable sighting,
+  or "TIMEOUT: …" if nothing matched. While spinning, context may also include "OBJECT_IN_VIEW:" when YOLO sees the
+  target in the current frame.
 - "move_forward": Field "meters" (required number). Use **generous** steps: prefer **0.55–0.9** m per call
   (typical 0.6–0.75) so the robot covers ground quickly; the runtime may bump small values to a minimum stride.
   One straight segment per response. After locate_object for nav goals.
 - "turn_degrees": Field "degrees" (required number). POSITIVE = turn left, NEGATIVE = turn right.
-- "look_up": Optional "degrees" (number, default ~12, range ~3–25). Tilts head up — use when searching high shelves / walls.
-- "look_down": Optional "degrees" (number, default ~**18** at runtime if omitted, range **8–30**). Tilts head **toward the floor** — **critical** for
-  objects that may sit **on the ground** (laptop, keyboard, backpack, book, phone, shoes, etc.). You **must** use
-  ``look_down`` often during search (not only after failures): e.g. **every 1–2 exploration steps** alternate with
-  ``move_forward`` / ``turn_degrees``, and **always** after ``TIMEOUT:`` / ``LOST:`` before only moving again.
-  Prefer **18–26°** when actively scanning for floor-level targets so YOLO sees the laptop / low object; include ``reason``.
-- "move_to_object": Field "aliases" (required). Vision-guided walk toward target. Use ONLY after "OBJECT_IN_VIEW:"
-  and/or "FOUND:" appears in CURRENT CONTEXT (target confirmed visible). The executor **creeps forward** when the
-  bbox grows, then ends the approach with **SUPER_CLOSE:** when vision thresholds are met; the **controller auto-completes the goal**
-  on SUPER_CLOSE (you do not need a follow-up "done" for that path).
+- "move_to_object": Field "aliases" (required). Vision + **RangeFinder depth** guided walk. Use ONLY after
+  "OBJECT_IN_VIEW:" and/or "FOUND:" in CURRENT CONTEXT. The robot aims to get within about **2 feet (~0.61 m)** of the
+  target when depth ``distance_m`` is reliable and the target is roughly centered (**SUPER_CLOSE:**). **Head pitch is
+  not an LLM action** — during approach the controller tilts the head **only** from the target's **vertical position in
+  the image** (above/below center); head yaw stays **0**. While walking, you will receive **APPROACH_CHECKPOINT:** about
+  every **10 seconds** (feet paused, head still tracking vertically, sonar + depth in context). On a checkpoint: return
+  **move_to_object** with the **same aliases** to continue, or **turn_degrees** / **move_forward** (keep **≤0.5 m**
+  for dodge) to avoid obstacles — **one** JSON action per response. After a dodge step finishes (**STEP_DONE** /
+  **APPROACH_INTERRUPT**), return **move_to_object** with the **same aliases** again to resume the approach. The
+  controller auto-completes the goal on SUPER_CLOSE (no separate "done" needed for that path).
 - "done": Task succeeded when the goal does not end with an automatic SUPER_CLOSE (e.g. non-approach goals), or
   if you judge success from the image before SUPER_CLOSE fires.
 - "fail": ONLY when absolutely impossible. Prefer locate_object + different moves first.
+- "clarify": Field "question" (required string) if you truly need user input.
 
 PASSING PARAMETERS (every response):
 - Always include "reason": one short string explaining the choice.
 - "locate_object" and "move_to_object" MUST include "aliases": ["…"] with at least one non-empty string.
 - "move_forward" MUST include "meters": <positive number>.
 - "turn_degrees" MUST include "degrees": <number>.
-- "look_up" MUST include "reason". "look_down" MUST include "reason" and usually explicit "degrees" (see look_down action above).
+- "clarify" MUST include "question".
 - Output exactly ONE JSON object per turn — no markdown fences, no extra keys beyond what the action needs.
+- **Depth:** In user messages, **distance_m** is **meters** from the **RangeFinder** (depth sensor) sampled at the
+  YOLO bounding box — that is the authoritative distance for approach and **SUPER_CLOSE** (~0.61 m / ~2 ft). The field
+  **distance** is a coarse **visual size bucket** from the 2D box, **not** meters — do not confuse it with depth.
 
 SEARCH + SIGNALS:
 - After locate_object, expect spin then FOUND or TIMEOUT; OBJECT_IN_VIEW may appear anytime YOLO sees the target.
-- While searching (after spin or between moves), issue ONE primitive per step: move_forward, turn_degrees, look_up, or look_down — or locate_object again to re-spin / re-search.
-- **Floor / laptop discipline:** If the user goal mentions a **laptop**, **keyboard**, **bag**, **floor**, **ground**, or any object that could be **below knee height**, treat ``look_down`` as a **first-class** tool: use it **often** (roughly half of non-move primitives) with **degrees** often **18–26** so the camera covers the floor in front of the robot. Do **not** chain many ``move_forward`` / ``turn_degrees`` steps without inserting ``look_down`` in between.
-- STEP_DONE may include FEEDBACK: (target vs image center). PROGRESS / STUCK during move_to_object; SUPER_CLOSE ends the run automatically.
+- While searching **after the spin** (between moves, still before FOUND), issue ONE primitive per step: **move_forward**,
+  **turn_degrees**, or **locate_object** again. Head stays **neutral**; you cannot command look_up/look_down (not supported).
+- STEP_DONE may include FEEDBACK: (target vs image center). During move_to_object expect **APPROACH_CHECKPOINT** (~10 s)
+  for safety replanning (path clear vs dodge). **STUCK:** means no progress for a long time — suggest turn then
+  re-approach. SUPER_CLOSE ends the run automatically.
 
 RECOVERY:
-- On TIMEOUT or LOST, your **next** step should often be ``look_down`` (strong floor scan, e.g. 20–26°) or ``locate_object`` again — not only ``move_forward``.
+- On TIMEOUT or LOST, prefer ``locate_object`` again, ``move_forward``, or ``turn_degrees`` while the head stays neutral.
 - Use "fail" only as a last resort.
 
 STRICT RULES:
 1. First step for go-to / find / approach goals: locate_object with good aliases (for laptops include synonyms like "laptop","computer","keyboard").
-2. Do not use move_to_object until OBJECT_IN_VIEW and/or FOUND has appeared in context.
-3. For approach goals, **move_to_object** often ends the run automatically when the controller receives a **SUPER_CLOSE** status (final creep); use **done** for other goals or if you judge success earlier from the image.
-4. When the goal may involve **floor-level** objects, use **look_down** regularly with explicit **degrees** (see action list); do not omit it for many steps in a row.
-5. Follow PASSING PARAMETERS exactly.
+2. **Never** output ``look_up`` or ``look_down`` — they are **disabled**. Head pitch follows the target bbox vertically only; you control motion with locate_object / move_forward / turn_degrees / move_to_object / done / fail / clarify.
+3. Do not use move_to_object until OBJECT_IN_VIEW and/or FOUND has appeared in context.
+4. For approach goals, **move_to_object** ends automatically on **SUPER_CLOSE** (~2 ft / ~0.61 m depth when centered, or large bbox).
+  On **APPROACH_CHECKPOINT**, prefer **move_to_object** with unchanged aliases if the path is clear; otherwise dodge
+  (short **move_forward** ≤0.5 m, **turn_degrees**). Use **done** for non-approach goals.
+5. For **go to / approach** goals, plan until the robot is within about **2 feet** of the target (**distance_m** toward ~**0.61 m** when centered); that is the success band for SUPER_CLOSE.
+6. Follow PASSING PARAMETERS exactly.
 
 JSON EXAMPLES:
 {"action":"locate_object","aliases":["dog","puppy"],"reason":"Spin search for dog."}
 {"action":"locate_object","aliases":["laptop","computer","keyboard"],"reason":"Search for laptop on floor or desk."}
-{"action":"look_down","degrees":22,"reason":"Scan floor for laptop after last move."}
 {"action":"move_forward","meters":0.65,"reason":"Timeout after spin; advance into room."}
-{"action":"move_to_object","aliases":["dog"],"reason":"FOUND in context; approach."}
+{"action":"move_to_object","aliases":["dog"],"reason":"APPROACH_CHECKPOINT clear; continue same aliases."}
 {"action":"done","reason":"Non-approach goal satisfied (or success before SUPER_CLOSE)."}
 {"action":"fail","reason":"No safe path after exhaustive retries."}
 """
+
+
+_GOAL_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "to",
+        "go",
+        "get",
+        "and",
+        "for",
+        "nao",
+        "robot",
+        "walk",
+        "move",
+        "head",
+        "toward",
+        "towards",
+        "near",
+        "find",
+        "locate",
+        "approach",
+        "please",
+        "me",
+        "from",
+        "with",
+        "that",
+        "this",
+        "your",
+        "its",
+        "our",
+        "use",
+        "then",
+        "when",
+        "how",
+        "can",
+        "you",
+        "let",
+        "make",
+        "just",
+    }
+)
+
+
+def _label_matches_user_goal(goal: str, label: str) -> bool:
+    lc = (label or "").strip().lower()
+    g = (goal or "").lower()
+    if not lc or not g:
+        return False
+    if lc in g:
+        return True
+    for w in g.replace(",", " ").replace(".", " ").split():
+        w = w.strip("?!'\"")
+        if len(w) < 3 or w in _GOAL_STOPWORDS:
+            continue
+        if w == lc or w in lc or lc in w:
+            return True
+    return False
+
+
+def _target_distance_summary(goal: str, objs: List[dict]) -> str:
+    """Repeat RangeFinder depth for detections that plausibly match the user goal (e.g. dog)."""
+    lines: List[str] = []
+    for o in objs:
+        lb = o.get("label")
+        if not lb or not _label_matches_user_goal(goal, str(lb)):
+            continue
+        dm = o.get("distance_m")
+        try:
+            dmv = float(dm) if dm is not None else None
+        except (TypeError, ValueError):
+            dmv = None
+        pos = o.get("position", "?")
+        if dmv is not None:
+            lines.append(
+                f"  - {lb}: distance_m={dmv:.3f} m (RangeFinder @ YOLO bbox), position={pos}"
+            )
+        else:
+            lines.append(
+                f"  - {lb}: distance_m=n/a (no RangeFinder sample for this box), position={pos}"
+            )
+    if not lines:
+        return ""
+    return (
+        "TARGET DEPTH (goal-relevant rows — use **distance_m** in meters for range, not the `distance` bucket):\n"
+        + "\n".join(lines)
+        + "\n"
+    )
 
 
 def build_planner_user_text(goal: str, scene_state: dict, context: str) -> str:
@@ -107,11 +212,18 @@ def build_planner_user_text(goal: str, scene_state: dict, context: str) -> str:
         xy_s = ""
         if cx is not None and cy is not None:
             xy_s = f", cx_norm={cx}, cy_norm={cy}"
+        dm = o.get("distance_m")
+        try:
+            dmv = float(dm) if dm is not None else None
+        except (TypeError, ValueError):
+            dmv = None
+        dm_s = f", distance_m={dmv:.3f}" if dmv is not None else ", distance_m=n/a"
         obj_list.append(
-            f"- {o['label']}: position={o['position']}, distance={o['distance']}{hf_s}{xy_s}"
+            f"- {o['label']}: position={o['position']}, distance={o['distance']}{dm_s}{hf_s}{xy_s}"
         )
 
     objs_str = "\n".join(obj_list) if obj_list else "(None)"
+    target_depth = _target_distance_summary(goal, objs)
 
     gl = goal.lower()
     floor_scan_reminder = ""
@@ -133,33 +245,40 @@ def build_planner_user_text(goal: str, scene_state: dict, context: str) -> str:
         )
     ):
         floor_scan_reminder = (
-            "\nFLOOR-VISION REMINDER: This goal may involve something **on the floor or a low surface**. "
-            "Use **look_down** often (e.g. every 1–2 steps with other primitives) with **degrees** typically **18–26** "
-            "so the camera sees low objects (e.g. laptop). Do not rely only on move_forward / turn_degrees.\n"
+            "\nLOW-OBJECT NOTE: The goal may involve something low. The head stays **level** during search; "
+            "after the target is visible, **move_to_object** handles approach while head pitch tracks the bbox vertically — "
+            "you cannot command look_down.\n"
         )
 
     cu = (context or "").upper()
     if not obj_list and ("TIMEOUT" in cu or "LOST" in cu):
         floor_scan_reminder += (
-            "\nNO TARGET IN VISIBLE OBJECTS after search trouble — use **look_down** (strong pitch, e.g. **20–28°**) "
-            "to sweep the **floor** in front of the robot before only moving or turning again.\n"
+            "\nNO TARGET IN VISIBLE OBJECTS after search trouble — prefer **locate_object**, **move_forward**, or "
+            "**turn_degrees** (head stays neutral).\n"
         )
+
+    rf_legend = (
+        "RANGE_FINDER: **distance_m** is true depth in **meters** from the Webots RangeFinder sampled at the "
+        "YOLO bbox (same geometry as the RGB frame for alignment). It is **not** inferred from RGB appearance. "
+        "The **distance** field on each line is a coarse **2D box size bucket**, not meters.\n\n"
+    )
 
     return f"""USER GOAL: {goal}
 CURRENT CONTEXT: {context or "Initial planning — no executor status yet"}
 
-VISIBLE OBJECTS:
+{rf_legend}{target_depth}VISIBLE OBJECTS:
 {objs_str}
 
 SONAR: Left={scene_state.get('sonar',{}).get('left_m')}m, Right={scene_state.get('sonar',{}).get('right_m')}m
 {floor_scan_reminder}
 If the goal is to go to / find / approach an object, your FIRST response MUST be locate_object with a non-empty "aliases" list.
-That starts a **360° spin** plus detection; watch for FOUND:, TIMEOUT:, and OBJECT_IN_VIEW: in CURRENT CONTEXT.
-Then use move_forward / turn_degrees / look_up / **look_down** (one tool per step) as needed. **Bias toward look_down**
-when the target could be on the floor (laptop, electronics, bags) — insert look_down regularly, not only after failures.
-Then move_to_object after the target is confirmed visible.
+That starts a **360° spin** (head **neutral / level**) plus detection; watch for FOUND:, TIMEOUT:, and OBJECT_IN_VIEW: in CURRENT CONTEXT.
+After the spin, explore with **move_forward** and **turn_degrees** (one tool per step). **look_up** and **look_down**
+are **not supported** — head stays neutral until approach; then pitch follows the target vertically only.
+Then move_to_object after the target is confirmed visible. While approaching, respond to **APPROACH_CHECKPOINT:**
+(continue with same **move_to_object** aliases, or dodge with move/turn only). Goal: reach within about **2 ft (~0.61 m)** RangeFinder depth when centered.
 Always pass the required JSON fields for each tool (see system prompt). Prefer **0.55–0.9 m** for move_forward when exploring.
-Use "done" when the goal is met **without** relying on SUPER_CLOSE (e.g. inspection-only goals). For go-to-object, prefer move_to_object and let final creep + SUPER_CLOSE finish the task.
+Use "done" when the goal is met **without** relying on SUPER_CLOSE (e.g. inspection-only goals). For go-to-object, use move_to_object and let depth / bbox + SUPER_CLOSE finish when within ~**2 ft** (~0.61 m).
 
 What is your next action? Respond in JSON only."""
 

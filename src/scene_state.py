@@ -6,7 +6,8 @@ Produces both:
   2. compatibility payload: state["scene"]["objects"]
 
 Distance behavior:
-  - Prefer HeadRangeFinder depth inside the YOLO bounding box.
+  - Prefer RangeFinder depth (device ``NAO_RANGE_FINDER_NAME``, default ``HeadRangeFinder``)
+    inside the YOLO bounding box.
   - Fall back to a rough bounding-box bucket when depth is unavailable.
 """
 
@@ -17,12 +18,18 @@ import cv2
 import numpy as np
 from typing import Optional
 
+from range_finder_util import (
+    default_range_finder_name,
+    median_depth_in_camera_box,
+    read_range_depth_hw,
+)
+
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT_DIR = os.path.join(_SRC_DIR, "snapshots")
 
 NAO_HFOV_DEG = 60.9
 NAO_VFOV_DEG = 47.6
-RANGEFINDER_NAME = "HeadRangeFinder"
+RANGEFINDER_NAME = default_range_finder_name()
 SONAR_SENSORS = ["Sonar/Left", "Sonar/Right"]
 
 NAO_JOINTS = [
@@ -108,6 +115,11 @@ class SceneStateExtractor:
             f"Joints={len(self._joints)}"
         )
 
+    @property
+    def range_finder(self):
+        """Webots RangeFinder device (or ``None``) — same instance used for ``distance_m``."""
+        return self._rangefinder
+
     def _screen_label(self, cx_px: int) -> str:
         w = self._camera.getWidth()
         frac = cx_px / w if w > 0 else 0.5
@@ -163,35 +175,16 @@ class SceneStateExtractor:
         if self._rangefinder is None:
             return None
         try:
-            rf_w = self._rangefinder.getWidth()
-            rf_h = self._rangefinder.getHeight()
-            if rf_w <= 0 or rf_h <= 0:
+            depth = read_range_depth_hw(self._rangefinder)
+            if depth is None:
                 return None
-            depth = np.array(self._rangefinder.getRangeImage(), dtype=np.float32).reshape((rf_h, rf_w))
+            mn = float(self._rangefinder.getMinRange())
+            mx = float(self._rangefinder.getMaxRange())
             cam_w = self._camera.getWidth()
             cam_h = self._camera.getHeight()
-            if cam_w <= 0 or cam_h <= 0:
-                return None
-
-            # Use the center 60% of bbox to avoid background edge pixels.
-            shrink = 0.20
-            sx = x + w * shrink
-            sy = y + h * shrink
-            sw = w * (1.0 - 2.0 * shrink)
-            sh = h * (1.0 - 2.0 * shrink)
-
-            x1 = int(max(0, sx / cam_w * rf_w))
-            y1 = int(max(0, sy / cam_h * rf_h))
-            x2 = int(min(rf_w, (sx + sw) / cam_w * rf_w))
-            y2 = int(min(rf_h, (sy + sh) / cam_h * rf_h))
-            if x2 <= x1 or y2 <= y1:
-                return None
-            patch = depth[y1:y2, x1:x2]
-            valid = patch[np.isfinite(patch)]
-            valid = valid[(valid > 0.05) & (valid < 10.0)]
-            if valid.size == 0:
-                return None
-            return round(float(np.median(valid)), 3)
+            return median_depth_in_camera_box(
+                depth, cam_w, cam_h, x, y, w, h, min_m=mn + 1e-4, max_m=mx - 1e-3
+            )
         except Exception as exc:
             print(f"[SceneState] RangeFinder depth error: {exc}")
             return None

@@ -30,7 +30,8 @@ OLLAMA_MODEL ?= llama3.2-vision
 all: help
 
 # ---------------------------------------------------------------------------
-## run         — download models (if needed) then launch the NAO controller
+## run         — download models (if needed) then launch nao_cam + TaskPlanner.
+##               LLM default: Ollama. For Gemini API: TASK_PLANNER_BACKEND=gemini + GEMINI_API_KEY in .env
 run: models
 	@echo ">>> Starting NAO YOLO controller (robot=$(ROBOT_NAME), port=$(PORT))…"
 	@if [ -d .venv ]; then \

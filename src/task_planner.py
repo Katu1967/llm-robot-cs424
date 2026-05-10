@@ -1,5 +1,5 @@
 """
-task_planner.py — Llama 3 Task Planner Agent (via Ollama)
+task_planner.py — Task planner for PlanExecutor (Ollama or Google Gemini).
 
 The TaskPlanner subscribes to the "scene_state" topic on the SceneBus.
 It only calls the LLM when one of two conditions is true:
@@ -29,8 +29,11 @@ Requirements:
   3. Start server:    ollama serve          (runs on http://localhost:11434)
 
 Optional env vars (set in .env or shell):
+  TASK_PLANNER_BACKEND — "ollama" (default) or "gemini" for Google Gemini (same stack as simple_planner).
   OLLAMA_MODEL  — model name, default "llama3.2-vision"
   OLLAMA_HOST   — server URL, default "http://localhost:11434"
+  GEMINI_API_KEY or GOOGLE_API_KEY — required when backend is gemini
+  GEMINI_MODEL  — optional, default "gemini-2.0-flash"
 """
 
 import os
@@ -57,6 +60,11 @@ except ImportError:
 
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2-vision")
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
+
+_TASK_BACKEND_RAW = (os.getenv("TASK_PLANNER_BACKEND") or "ollama").strip().lower()
+if _TASK_BACKEND_RAW not in ("ollama", "gemini"):
+    _TASK_BACKEND_RAW = "ollama"
+TASK_PLANNER_BACKEND = _TASK_BACKEND_RAW
 
 # Maximum characters of joint data to send (cuts down token usage)
 MAX_JOINT_CHARS = 400
@@ -172,11 +180,12 @@ Always respond with a single valid JSON object — no markdown, no code fences:
 
 class TaskPlanner:
     """
-    Llama 3 task planning agent (via Ollama local server).
+    Task planning agent: Ollama (local) or Google Gemini (API), selected by
+    ``TASK_PLANNER_BACKEND`` (default: ollama).
 
     Parameters
     ----------
-    model   : Ollama model tag (default: llama3.2-vision)
+    model   : Ollama model tag (default: llama3.2-vision); ignored when backend is gemini
     host    : Ollama server URL (default: http://localhost:11434)
     verbose : print LLM responses to stdout
     """
@@ -190,34 +199,54 @@ class TaskPlanner:
         self._model   = model
         self._host    = host
         self._verbose = verbose
+        self._backend = TASK_PLANNER_BACKEND
+        self._client = None
+        self._gemini_ok = False
 
-        # --- Lazy-import ollama (defer until after Webots connects) ---
-        print("[TaskPlanner] Importing ollama…")
-        try:
-            import ollama as _ollama
-            self._ollama = _ollama
-            ollama_available = True
-        except ImportError:
-            self._ollama = None
-            ollama_available = False
-            print("[TaskPlanner] WARNING: 'ollama' package not installed. "
-                  "Run: pip install ollama")
-
-        # --- Verify the Ollama server is reachable ---
-        if ollama_available:
+        if self._backend == "gemini":
             try:
-                # Set a 60s timeout for the client so it doesn't hang forever
-                client = _ollama.Client(host=host, timeout=60.0)
-                client.list()
-                self._client = client
-                print(f"[TaskPlanner] Ollama server reachable at {host}")
-                print(f"[TaskPlanner] Using model: {model} (60s timeout)")
-            except Exception as e:
-                self._client = None
-                print(f"[TaskPlanner] WARNING: Cannot reach Ollama server at {host}: {e}")
-                print("[TaskPlanner] Make sure 'ollama serve' is running — falling back to STUB mode.")
+                from gemini_llm_connector import gemini_available
+
+                self._gemini_ok = bool(gemini_available())
+            except ImportError:
+                self._gemini_ok = False
+            gemini_model = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+            if self._gemini_ok:
+                print(
+                    f"[TaskPlanner] Backend: Gemini | model={gemini_model!r} "
+                    f"(GEMINI_API_KEY / GOOGLE_API_KEY)"
+                )
+            else:
+                print(
+                    "[TaskPlanner] TASK_PLANNER_BACKEND=gemini but Gemini is unavailable "
+                    "(install google-genai, set GEMINI_API_KEY). Falling back to STUB."
+                )
         else:
-            self._client = None
+            # --- Lazy-import ollama (defer until after Webots connects) ---
+            print("[TaskPlanner] Importing ollama…")
+            try:
+                import ollama as _ollama
+                self._ollama = _ollama
+                ollama_available = True
+            except ImportError:
+                self._ollama = None
+                ollama_available = False
+                print("[TaskPlanner] WARNING: 'ollama' package not installed. "
+                      "Run: pip install ollama")
+
+            # --- Verify the Ollama server is reachable ---
+            if ollama_available:
+                try:
+                    client = _ollama.Client(host=host, timeout=60.0)
+                    client.list()
+                    self._client = client
+                    print(f"[TaskPlanner] Backend: Ollama | host={host} | model={model} (60s timeout)")
+                except Exception as e:
+                    self._client = None
+                    print(f"[TaskPlanner] WARNING: Cannot reach Ollama server at {host}: {e}")
+                    print("[TaskPlanner] Make sure 'ollama serve' is running — falling back to STUB mode.")
+            else:
+                self._client = None
 
         # --- State ---
         self._task:             Optional[str]  = None   # current goal string
@@ -399,7 +428,7 @@ class TaskPlanner:
         """Calls the LLM and stores the result.  Always runs in a thread."""
         t0 = time.time()
         try:
-            plan = self._call_llama(task, state, snapshot_path, failure_context)
+            plan = self._call_llm(task, state, snapshot_path, failure_context)
             plan = self._postprocess_plan(plan, task, state)
             elapsed = time.time() - t0
 
@@ -415,20 +444,42 @@ class TaskPlanner:
                 self._planning = False
 
     # ------------------------------------------------------------------
-    # Llama / Ollama API call
+    # LLM backends (Ollama / Gemini)
     # ------------------------------------------------------------------
 
-    def _call_llama(
+    def _build_user_text(
+        self,
+        task:            Optional[str],
+        state:           dict,
+        failure_context: Optional[str],
+    ) -> str:
+        """Plain user message for the task planner (Ollama or Gemini)."""
+        slim_state = self._slim_state(state)
+        text_parts = []
+        if failure_context:
+            text_parts.append(
+                f"REPLAN REQUEST\n"
+                f"The previous plan step failed:\n{failure_context}\n\n"
+                f"Please analyse the failure and produce a revised plan.\n"
+            )
+        text_parts.append(
+            f"TASK: {task or '(no task — ask for clarification)'}\n\n"
+            f"CURRENT SCENE STATE:\n"
+            f"{json.dumps(slim_state, indent=2)}"
+        )
+        return "\n".join(text_parts)
+
+    def _call_llm(
         self,
         task:            Optional[str],
         state:           dict,
         snapshot_path:   str,
         failure_context: Optional[str],
     ) -> dict:
-        """
-        Build and send the request to the local Ollama/Llama server.
-        Returns a parsed plan dict.
-        """
+        """Call configured backend; return parsed plan dict."""
+        if self._backend == "gemini" and self._gemini_ok:
+            return self._call_gemini(task, state, snapshot_path, failure_context)
+
         if self._client is None:
             return self._stub_plan(task, state)
 
@@ -452,6 +503,40 @@ class TaskPlanner:
             print(f"[TaskPlanner] Could not parse Llama response as JSON: {e}")
             print(f"[TaskPlanner] Raw response: {raw[:300]}…")
             return {"raw_response": raw, "plan": [], "reasoning": "Parse error."}
+
+    def _call_gemini(
+        self,
+        task:            Optional[str],
+        state:           dict,
+        snapshot_path:   str,
+        failure_context: Optional[str],
+    ) -> dict:
+        """Google Gemini with the same JSON plan schema as Ollama."""
+        from gemini_llm_connector import extract_json_plan, gemini_generate_content
+
+        user_text = self._build_user_text(task, state, failure_context)
+        snap = snapshot_path if (snapshot_path and os.path.isfile(snapshot_path)) else None
+        if snap:
+            print(f"[TaskPlanner] Gemini: attaching snapshot {os.path.basename(snap)}")
+        else:
+            print("[TaskPlanner] Gemini: text-only (no snapshot file on disk)")
+
+        try:
+            raw = gemini_generate_content(
+                user_text,
+                system_instruction=_SYSTEM_PROMPT,
+                snapshot_path=snap,
+            )
+        except Exception as e:
+            print(f"[TaskPlanner] Gemini request failed: {e}")
+            return self._stub_plan(task, state)
+
+        plan = extract_json_plan(raw)
+        if not isinstance(plan, dict) or "plan" not in plan:
+            print("[TaskPlanner] Gemini: response was not a valid task plan JSON.")
+            print(f"[TaskPlanner] Raw (truncated): {(raw or '')[:400]}…")
+            return self._stub_plan(task, state)
+        return plan
 
     def _postprocess_plan(self, plan: dict, task: Optional[str], state: dict) -> dict:
         """
@@ -546,39 +631,13 @@ class TaskPlanner:
     ) -> list:
         """
         Build the Ollama messages list.
-        System prompt is a separate message; image attached to the user message.
+        System prompt is a separate message; user text only (snapshot path is
+        passed to Gemini separately; Ollama path remains text-only for speed).
         """
-        slim_state = self._slim_state(state)
-
-        # --- User message text ---
-        text_parts = []
-        if failure_context:
-            text_parts.append(
-                f"REPLAN REQUEST\n"
-                f"The previous plan step failed:\n{failure_context}\n\n"
-                f"Please analyse the failure and produce a revised plan.\n"
-            )
-        text_parts.append(
-            f"TASK: {task or '(no task — ask for clarification)'}\n\n"
-            f"CURRENT SCENE STATE:\n"
-            f"{json.dumps(slim_state, indent=2)}"
-        )
-        user_text = "\n".join(text_parts)
-
-        # --- Build message list ---
+        user_text = self._build_user_text(task, state, failure_context)
         user_msg: dict = {"role": "user", "content": user_text}
 
-        # Snapshot disabled per user request to speed up testing
-        # if snapshot_path and os.path.isfile(snapshot_path):
-        #     try:
-        #         import base64
-        #         from io import BytesIO
-        #         from PIL import Image
-        #         ...
-        #     except Exception as e:
-        #         print(f"[TaskPlanner] Could not encode snapshot: {e}")
-        # else:
-        print("[TaskPlanner] Snapshot disabled — sending text state only.")
+        print("[TaskPlanner] Ollama: text-only user message (snapshot not attached).")
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},

@@ -48,6 +48,15 @@ def format_object_in_view_line(label: str, obj: dict) -> str:
         f"position={obj.get('position', '?')}",
         f"distance={obj.get('distance', '?')}",
     ]
+    dm = obj.get("distance_m")
+    try:
+        dmv = float(dm) if dm is not None else None
+    except (TypeError, ValueError):
+        dmv = None
+    if dmv is not None:
+        parts.append(f"distance_m={dmv:.3f} (RangeFinder depth at bbox, meters)")
+    else:
+        parts.append("distance_m=n/a (RangeFinder not available for this box)")
     if hf is not None:
         parts.append(f"height_frac={hf}")
     if cx is not None and cy is not None:
@@ -73,7 +82,17 @@ def format_feedback_line(scene_state: Optional[dict], aliases: List[str]) -> str
     elif pos == "right":
         rel = "right of image center — consider turning right"
     hf = obj.get("height_frac", "?")
+    dm = obj.get("distance_m")
+    try:
+        dmv = float(dm) if dm is not None else None
+    except (TypeError, ValueError):
+        dmv = None
+    dm_bit = (
+        f", distance_m={dmv:.3f}m (RangeFinder)"
+        if dmv is not None
+        else ", distance_m=n/a"
+    )
     return (
         f"FEEDBACK: target '{lbl}' visible — position={pos} ({rel}), "
-        f"height_frac={hf}, cx_norm={cx}, cy_norm={cy}"
+        f"height_frac={hf}, cx_norm={cx}, cy_norm={cy}{dm_bit}"
     )
