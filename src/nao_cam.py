@@ -50,6 +50,13 @@ def main():
     width  = camera.getWidth()
     height = camera.getHeight()
     print(f"[nao_cam] Connected: {width}x{height} @ {1000 // TIMESTEP} fps")
+
+    rangefinder = robot.getDevice("HeadRangeFinder")
+    print("RangeFinder:", rangefinder)
+    if rangefinder is not None:
+        rangefinder.enable(TIMESTEP)
+        print("RangeFinder enabled")
+
     print("[nao_cam] Loading YOLO model…")
     detector = YOLODetector(
         confidence_threshold=CONFIDENCE_THRESHOLD,
@@ -166,7 +173,19 @@ def main():
                 loaded = executor.load_plan(new_plan)
                 print(f"[DEBUG] load_plan returned: {loaded}")
                 planner.consume_plan()
+        # Publish live scene state every frame while executor is running
+        if not executor.is_idle:
+            sim_time_ms = int(robot.getTime() * 1000)
 
+            state, snapshot_path = extractor.capture(
+                bgr_frame=bgr,
+                detections=last_detections,
+                sim_time_ms=sim_time_ms,
+                frame_count=frame_count,
+                trigger="live_tracking",
+            )
+
+            bus.publish("scene_state", state, snapshot_path)
         # ── Tick executor ─────────────────────────────────────────────
         executor.tick()
 

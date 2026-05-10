@@ -14,6 +14,7 @@ Also exposes get_gps_position() for debugging whether the robot is physically mo
 import os
 import math
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -306,9 +307,9 @@ class NaoInterface:
         self,
         cx_norm: float,
         cy_norm: float,
-        alpha: float | None = None,
-        pitch_gain: float | None = None,
-        floor_pitch_boost: float | None = None,
+        alpha: Optional[float] = None,
+        pitch_gain: Optional[float] = None,
+        floor_pitch_boost: Optional[float] = None,
     ):
         """
         Point head toward normalized image coords (0–1). x: left=0, right=1; y: top=0, bottom=1.

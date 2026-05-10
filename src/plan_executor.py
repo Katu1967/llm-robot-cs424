@@ -549,27 +549,94 @@ class PlanExecutor:
 
     def _find_object(self, label: str) -> Optional[dict]:
         """
-        Query SceneBus for a detected object matching `label`.
-        Uses the simplified scene state schema: {label, position, distance}.
-        Returns the object dict if found, None otherwise.
+        Query SceneBus for a detected object matching `label` and normalize both
+        supported scene schemas:
+          - simple schema: state["objects"]
+          - compatibility schema: state["scene"]["objects"]
+        Returns a dict with cx_norm, cy_norm, h_norm, and distance_m.
         """
         if self.bus is None:
             return None
 
-        latest = self.bus.get_latest("scene_state")
-        if not latest:
+        scene = self.bus.get_latest("scene_state")
+        if not scene:
             return None
 
-        # Unpack (state, snapshot_path) tuple if needed
-        scene_state = latest[0] if isinstance(latest, (tuple, list)) else latest
-        if not isinstance(scene_state, dict):
+        if isinstance(scene, (tuple, list)) and scene:
+            scene = scene[0]
+        if not isinstance(scene, dict):
             return None
 
-        objects = scene_state.get("objects", [])
-        for obj in objects:
-            if obj.get("label", "").lower() == label.lower():
-                return obj
-        return None
+        if isinstance(scene.get("objects"), list):
+            raw_dets = scene.get("objects", [])
+        elif isinstance(scene.get("detections"), list):
+            raw_dets = scene.get("detections", [])
+        else:
+            raw_dets = scene.get("scene", {}).get("objects", [])
+
+        if not raw_dets:
+            return None
+
+        cam = scene.get("camera", {}) if isinstance(scene, dict) else {}
+        res = cam.get("resolution", {}) if isinstance(cam, dict) else {}
+        fw = res.get("width") or scene.get("frame_width") or 640
+        fh = res.get("height") or scene.get("frame_height") or 480
+
+        target = label.lower().strip()
+        matches = []
+
+        for d in raw_dets:
+            lbl = str(d.get("label", "")).lower().strip()
+            if not lbl:
+                continue
+            if lbl != target and target not in lbl and lbl not in target:
+                continue
+
+            bb = d.get("bounding_box", {}) if isinstance(d.get("bounding_box"), dict) else {}
+            x = bb.get("x", d.get("x", 0))
+            y = bb.get("y", d.get("y", 0))
+            w = bb.get("width", d.get("w", d.get("width", 0)))
+            h = bb.get("height", d.get("h", d.get("height", 0)))
+
+            sp = d.get("screen_position", {}) if isinstance(d.get("screen_position"), dict) else {}
+            cx_norm = d.get("cx_norm", sp.get("x_norm"))
+            cy_norm = d.get("cy_norm", sp.get("y_norm"))
+            if cx_norm is None:
+                cx_norm = (x + w / 2) / fw if fw else 0.5
+            if cy_norm is None:
+                cy_norm = (y + h / 2) / fh if fh else 0.5
+
+            h_norm = d.get("h_norm", d.get("height_frac"))
+            w_norm = d.get("w_norm", d.get("width_frac"))
+            if h_norm is None:
+                h_norm = h / fh if fh else 0.0
+            if w_norm is None:
+                w_norm = w / fw if fw else 0.0
+
+            distance_m = (
+                d.get("depth_distance_m")
+                if d.get("depth_distance_m") is not None
+                else d.get("distance_m")
+                if d.get("distance_m") is not None
+                else d.get("estimated_distance_m")
+            )
+
+            matches.append({
+                "label": lbl,
+                "cx_norm": float(cx_norm),
+                "cy_norm": float(cy_norm),
+                "w_norm": float(w_norm),
+                "h_norm": float(h_norm),
+                "confidence": float(d.get("confidence", 0.0)),
+                "bearing_deg": d.get("horizontal_angle_deg"),
+                "distance_m": distance_m,
+                "raw": d,
+            })
+
+        if not matches:
+            return None
+
+        return max(matches, key=lambda d: d.get("confidence", 0.0))
 
 
 def _hash_plan(steps: list) -> str:

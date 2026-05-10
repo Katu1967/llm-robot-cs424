@@ -36,6 +36,7 @@ class SimpleExecutor:
     SUPER_CLOSE_HF = float(os.getenv("SIMPLE_SUPER_CLOSE_HF", "0.62"))
     FINAL_CREEP_TIMEOUT_S = float(os.getenv("SIMPLE_FINAL_CREEP_TIMEOUT_S", "7.0"))
     FORCE_SUPER_CLOSE_HF = float(os.getenv("SIMPLE_FORCE_SUPER_CLOSE_HF", "0.56"))
+    STOP_DISTANCE_M = float(os.getenv("SIMPLE_STOP_DISTANCE_M", "0.40"))
 
     _follow_look_alpha = float(os.getenv("NAO_FOLLOW_LOOK_ALPHA", "0.22"))
     _follow_pitch_gain = float(os.getenv("NAO_FOLLOW_PITCH_GAIN", "0.62"))
@@ -230,6 +231,7 @@ class SimpleExecutor:
             self._stuck_timer  = 0.0
 
             dist = obj.get("distance", "far")
+            real_dist = obj.get("distance_m")
             pos = obj.get("position", "center")
             hf_obj = obj.get("height_frac")
             hf_val = float(hf_obj) if hf_obj is not None else _height_frac_from_bucket(dist)
@@ -263,10 +265,18 @@ class SimpleExecutor:
                 ):
                     super_close = True
 
+            if real_dist is not None and centered_loose:
+                try:
+                    if float(real_dist) <= self.STOP_DISTANCE_M:
+                        super_close = True
+                except (TypeError, ValueError):
+                    pass
+
             if super_close:
                 self.stop()
+                dist_msg = f"distance_m={float(real_dist):.3f}m" if real_dist is not None else f"distance={dist}"
                 self._on_status(
-                    f"SUPER_CLOSE: {lbl} (height_frac={hf_val:.2f}, distance={dist}) "
+                    f"SUPER_CLOSE: {lbl} (height_frac={hf_val:.2f}, {dist_msg}) "
                     "— final approach threshold met.",
                     obj,
                 )

@@ -96,7 +96,7 @@ Primitive:
 Semantic (use when objects are detected):
   look_for_object      { "label": "<coco_name>", "timeout_s": <number> }
   center_on_object     { "label": "<coco_name>", "tolerance": 0.1, "timeout_s": 5 }
-  move_toward_object   { "label": "<coco_name>", "target_height": 0.35, "timeout_s": 10 }
+  move_toward_object   { "label": "<coco_name>", "stop_distance_m": 0.40, "timeout_s": 24 }
   pick_object          { "label": "<coco_name>" }
   place_object         {}
 
@@ -133,7 +133,7 @@ CRITICAL RULES:
 - robot.joint_positions: all 25 joint angles in radians
 - sensors.sonar     : left_m / right_m obstacle distances
 - sensors.touch     : bumper states (bool)
-- scene.objects[]   : label, confidence, bounding_box, estimated_distance_m,
+- scene.objects[]   : label, confidence, bounding_box, depth_distance_m / distance_m,
                       relative_distance, horizontal_angle_deg, centred_in_frame
 
 ## Response Format
@@ -480,7 +480,7 @@ class TaskPlanner:
             {
                 "step": 1,
                 "action": "move_toward_object",
-                "parameters": {"label": target_label, "target_height": 0.28, "timeout_s": 24},
+                "parameters": {"label": target_label, "stop_distance_m": 0.40, "timeout_s": 24},
                 "description": f"Move toward the visible {target_label}.",
             },
         ]
@@ -522,7 +522,7 @@ class TaskPlanner:
             if any(word in task_text for word in words):
                 return canonical
 
-        for obj in state.get("scene", {}).get("objects", []):
+        for obj in (state.get("scene", {}).get("objects") or state.get("objects", [])):
             label = str(obj.get("label", "")).strip().lower()
             if label and label in task_text:
                 return label
@@ -532,7 +532,7 @@ class TaskPlanner:
     def _is_object_visible(self, state: dict, label: str) -> bool:
         """Return True when the target label appears in scene.objects."""
         target = label.strip().lower()
-        for obj in state.get("scene", {}).get("objects", []):
+        for obj in (state.get("scene", {}).get("objects") or state.get("objects", [])):
             if str(obj.get("label", "")).strip().lower() == target:
                 return True
         return False
@@ -609,7 +609,7 @@ class TaskPlanner:
     def _stub_plan(self, task: Optional[str], state: dict) -> dict:
         """Build a simple executable fallback plan when Ollama is unavailable."""
         goal_text = (task or "").lower()
-        objects = state.get("scene", {}).get("objects", [])
+        objects = (state.get("scene", {}).get("objects") or state.get("objects", []))
         obj_names = [str(o.get("label", "")).lower() for o in objects if o.get("label")]
         target_label = self._infer_target_label(task, state)
         visible_target = target_label if target_label and self._is_object_visible(state, target_label) else None
@@ -619,7 +619,7 @@ class TaskPlanner:
                 {
                     "step": 1,
                     "action": "move_toward_object",
-                    "parameters": {"label": visible_target, "target_height": 0.28, "timeout_s": 24},
+                    "parameters": {"label": visible_target, "stop_distance_m": 0.40, "timeout_s": 24},
                     "description": f"Move toward the visible {visible_target}.",
                 },
             ]
