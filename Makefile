@@ -33,7 +33,11 @@ all: help
 ## run         — download models (if needed) then launch the NAO controller
 run: models
 	@echo ">>> Starting NAO YOLO controller (robot=$(ROBOT_NAME), port=$(PORT))…"
-	$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) $(SCRIPT)
+	@if [ -d .venv ]; then \
+		PATH="$(CURDIR)/.venv/bin:$$PATH" $(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) $(SCRIPT); \
+	else \
+		$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) $(SCRIPT); \
+	fi
 
 # ---------------------------------------------------------------------------
 ## models      — download YOLO model files into src/models/ (skips if present)
