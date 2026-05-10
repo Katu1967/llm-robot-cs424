@@ -81,6 +81,7 @@ class NaoInterface:
         self._motions = {}
         self._active_motion_key = None
         self._active_motion = None
+        self._walk_fast_vx_thr = float(os.environ.get("NAO_WALK_FAST_VX_THRESHOLD", "0.08"))
         self._try_load_motions()
 
         print(
@@ -145,6 +146,7 @@ class NaoInterface:
 
         motion_files = {
             "forward": "Forwards.motion",
+            "forward_fast": "Forwards50.motion",
             "backward": "Backwards.motion",
             "turn_left": "TurnLeft60.motion",
             "turn_right": "TurnRight60.motion",
@@ -163,6 +165,14 @@ class NaoInterface:
                 print(f"[NaoInterface] WARNING: failed to load {filename}: {exc}")
 
         print(f"[NaoInterface] Motion files loaded: {sorted(self._motions.keys())}")
+
+        ff = "forward_fast" in self._motions
+        std = os.environ.get("NAO_FORWARD_PROFILE", "standard").lower() != "fast"
+        print(
+            f"[NaoInterface] Forward walk: "
+            f"{'Forwards50 (fast)' if ff and not std else 'Forwards (default)'} "
+            f"(set NAO_FORWARD_PROFILE=fast for Forwards50.motion)"
+        )
 
     # ------------------------------------------------------------------
     # GPS debug
@@ -223,8 +233,19 @@ class NaoInterface:
 
         if vx < -0.01:
             self._play_motion("backward", loop=True)
-        else:
+            return
+
+        use_fast = (
+            os.environ.get("NAO_FORWARD_PROFILE", "standard").lower() == "fast"
+            and float(vx) >= self._walk_fast_vx_thr
+            and "forward_fast" in self._motions
+        )
+        if use_fast:
+            self._play_motion("forward_fast", loop=True)
+        elif "forward" in self._motions:
             self._play_motion("forward", loop=True)
+        elif "forward_fast" in self._motions:
+            self._play_motion("forward_fast", loop=True)
 
     def start_turn(self, degrees: float):
         if degrees >= 0:
@@ -263,27 +284,52 @@ class NaoInterface:
         self._set("HeadYaw", angle)
 
     def set_head_pitch(self, angle: float):
-        angle = max(-0.5, min(0.5, float(angle)))
+        # Wider range so we can look further down at floor-level targets (~±37°)
+        angle = max(-0.64, min(0.64, float(angle)))
         self._head_pitch = angle
         self._set("HeadPitch", angle)
 
     def adjust_head_yaw(self, delta: float):
         self.set_head_yaw(self._head_yaw + float(delta))
 
+    def adjust_head_pitch(self, delta: float):
+        """Positive delta tilts head down (camera toward floor); negative looks up."""
+        self.set_head_pitch(self._head_pitch + float(delta))
+
+    def get_head_pitch(self) -> float:
+        return self._head_pitch
+
     def get_head_yaw(self) -> float:
         return self._head_yaw
 
-    def look_at_normalised(self, cx_norm: float, cy_norm: float):
+    def look_at_normalised(
+        self,
+        cx_norm: float,
+        cy_norm: float,
+        alpha: float | None = None,
+        pitch_gain: float | None = None,
+        floor_pitch_boost: float | None = None,
+    ):
+        """
+        Point head toward normalized image coords (0–1). x: left=0, right=1; y: top=0, bottom=1.
+        Low y = object high in frame (look up); high y = object low / on floor (look down).
+
+        ``pitch_gain`` scales vertical aiming (default 0.3; use ~0.55–0.75 when following ground objects).
+        ``floor_pitch_boost`` extra downward bias when cy_norm > 0.5 (rad, added to desired pitch).
+        """
         cx_norm = max(0.0, min(1.0, float(cx_norm)))
         cy_norm = max(0.0, min(1.0, float(cy_norm)))
 
         desired_yaw = -((cx_norm - 0.5) * math.pi * 0.5)
-        desired_pitch = (cy_norm - 0.5) * math.pi * 0.3
+        pg = 0.3 if pitch_gain is None else max(0.05, float(pitch_gain))
+        desired_pitch = (cy_norm - 0.5) * math.pi * pg
+        if floor_pitch_boost and cy_norm > 0.5:
+            desired_pitch += float(floor_pitch_boost) * (cy_norm - 0.5) * 2.0
 
-        alpha = 0.08
+        a = 0.08 if alpha is None else max(0.01, min(1.0, float(alpha)))
 
-        new_yaw = self._head_yaw + alpha * (desired_yaw - self._head_yaw)
-        new_pitch = self._head_pitch + alpha * (desired_pitch - self._head_pitch)
+        new_yaw = self._head_yaw + a * (desired_yaw - self._head_yaw)
+        new_pitch = self._head_pitch + a * (desired_pitch - self._head_pitch)
 
         self.set_head_yaw(new_yaw)
         self.set_head_pitch(new_pitch)

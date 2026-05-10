@@ -291,12 +291,12 @@ class PlanExecutor:
 
     def _act_move_toward_object(self, params: dict) -> Generator:
         """
-        Walk toward an object using live YOLO + depth.
+        Walk toward an object using live YOLO and scene feedback.
 
         Important behavior:
         - If the object is visible, keep trying even after timeout_s.
         - Only fail from timeout if the object is no longer visible.
-        - Stop when RangeFinder/depth distance <= stop_distance_m.
+        - Stop when vision / proximity heuristics indicate arrival (see executor params).
         """
 
         label           = params.get("label", "")
@@ -548,93 +548,28 @@ class PlanExecutor:
     # ------------------------------------------------------------------
 
     def _find_object(self, label: str) -> Optional[dict]:
+        """
+        Query SceneBus for a detected object matching `label`.
+        Uses the simplified scene state schema: {label, position, distance}.
+        Returns the object dict if found, None otherwise.
+        """
         if self.bus is None:
             return None
 
-        scene = self.bus.get_latest("scene_state")
-        if not scene:
+        latest = self.bus.get_latest("scene_state")
+        if not latest:
             return None
 
-        if isinstance(scene.get("detections"), list):
-            raw_dets = scene.get("detections", [])
-        else:
-            raw_dets = scene.get("scene", {}).get("objects", [])
-
-        norm = []
-
-        for d in raw_dets:
-            lbl = d.get("label", "")
-            if not lbl:
-                continue
-
-            if "bounding_box" in d:
-                bb = d["bounding_box"]
-                x  = bb.get("x", 0)
-                y  = bb.get("y", 0)
-                w  = bb.get("width",  bb.get("w", 0))
-                h  = bb.get("height", bb.get("h", 0))
-            else:
-                x = d.get("x", 0)
-                y = d.get("y", 0)
-                w = d.get("w", d.get("width", 0))
-                h = d.get("h", d.get("height", 0))
-
-            # Prefer RangeFinder depth, fall back to old visual estimate.
-            distance_m = (
-                d.get("depth_distance_m")
-                if d.get("depth_distance_m") is not None
-                else d.get("estimated_distance_m")
-            )
-
-            norm.append({
-                "label":       lbl,
-                "x":           x,
-                "y":           y,
-                "w":           w,
-                "h":           h,
-                "confidence":  d.get("confidence", 0),
-                "bearing_deg": d.get("horizontal_angle_deg"),
-                "distance_m":  distance_m,
-                "screen_pos":  d.get("screen_position", {}),
-            })
-
-        matches = [d for d in norm if d["label"].lower() == label.lower()]
-        if not matches:
+        # Unpack (state, snapshot_path) tuple if needed
+        scene_state = latest[0] if isinstance(latest, (tuple, list)) else latest
+        if not isinstance(scene_state, dict):
             return None
 
-        best = max(matches, key=lambda d: d["confidence"])
-
-        cam = scene.get("camera", {}) if isinstance(scene, dict) else {}
-        res = cam.get("resolution", {})
-
-        fw = res.get("width")  or scene.get("frame_width")  or 640
-        fh = res.get("height") or scene.get("frame_height") or 480
-
-        x, y, w, h = best["x"], best["y"], best["w"], best["h"]
-
-        sp = best.get("screen_pos") or {}
-
-        cx_norm = (
-            sp.get("x_norm")
-            if sp.get("x_norm") is not None
-            else (x + w / 2) / fw
-        )
-
-        cy_norm = (
-            sp.get("y_norm")
-            if sp.get("y_norm") is not None
-            else (y + h / 2) / fh
-        )
-
-        return {
-            "cx_norm":     cx_norm,
-            "cy_norm":     cy_norm,
-            "w_norm":      w / fw,
-            "h_norm":      h / fh,
-            "confidence":  best["confidence"],
-            "bearing_deg": best.get("bearing_deg"),
-            "distance_m":  best.get("distance_m"),
-        }
+        objects = scene_state.get("objects", [])
+        for obj in objects:
+            if obj.get("label", "").lower() == label.lower():
+                return obj
+        return None
 
 
 def _hash_plan(steps: list) -> str:

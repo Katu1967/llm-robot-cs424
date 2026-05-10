@@ -24,7 +24,7 @@ NAMES   := $(MODELS_DIR)/coco.names
 OLLAMA_MODEL ?= llama3.2-vision
 
 # ---------------------------------------------------------------------------
-.PHONY: all run models install pull-model serve clean help
+.PHONY: all run models install pull-model serve clean help simple
 
 # Default target
 all: help
@@ -38,6 +38,12 @@ run: models
 	else \
 		$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) $(SCRIPT); \
 	fi
+
+# ---------------------------------------------------------------------------
+## simple       — launch the new simple single-tool controller
+simple: models
+	@echo ">>> Starting NAO Simple controller (robot=$(ROBOT_NAME), port=$(PORT))…"
+	$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) src/simple_controller.py
 
 # ---------------------------------------------------------------------------
 ## models      — download YOLO model files into src/models/ (skips if present)

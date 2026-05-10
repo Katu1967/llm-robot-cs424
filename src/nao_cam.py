@@ -50,11 +50,6 @@ def main():
     width  = camera.getWidth()
     height = camera.getHeight()
     print(f"[nao_cam] Connected: {width}x{height} @ {1000 // TIMESTEP} fps")
-    rangefinder = robot.getDevice("HeadRangeFinder")
-    print("RangeFinder:", rangefinder)
-    if rangefinder is not None:
-        rangefinder.enable(TIMESTEP)
-        print("RangeFinder enabled")
     print("[nao_cam] Loading YOLO model…")
     detector = YOLODetector(
         confidence_threshold=CONFIDENCE_THRESHOLD,

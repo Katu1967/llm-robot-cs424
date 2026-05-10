@@ -4,3 +4,4 @@ ollama
 Pillow
 python-dotenv
 ultralytics
+google-genai
