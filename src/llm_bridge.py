@@ -1,15 +1,11 @@
 """
-llm_bridge.py — LLM Decision Bridge
+LLM decision bridge.
 
-Receives a scene state dict and a snapshot image path, then dispatches
-them to the LLM planning layer.
-
-Currently: prints everything to stdout for debugging.
-Future:     will call the vision + text LLM API and return a plan.
+Takes a scene state dict and a snapshot path. For now this only prints debug text.
+Later it can call a vision plus text API and return an action plan.
 
 Usage:
     from llm_bridge import LLMBridge
-
     bridge = LLMBridge()
     response = bridge.send(state_dict, snapshot_path)
 """
@@ -17,173 +13,143 @@ Usage:
 import json
 import os
 
-# ANSI colour helpers (gracefully disabled on terminals that don't support them)
-_RESET  = "\033[0m"
-_BOLD   = "\033[1m"
-_CYAN   = "\033[36m"
-_YELLOW = "\033[33m"
-_GREEN  = "\033[32m"
-_MAGENTA= "\033[35m"
-_DIM    = "\033[2m"
-
-
-def _header(text: str) -> str:
-    width = 70
-    pad   = (width - len(text) - 2) // 2
-    return f"\n{_BOLD}{_CYAN}{'─' * pad} {text} {'─' * pad}{_RESET}\n"
-
 
 class LLMBridge:
     """
-    Bridge between the scene state extractor and the LLM planning layer.
+    Connects scene state from the extractor to the planning layer.
 
-    Parameters
-    ----------
-    verbose : bool
-        If True, print the full JSON state. If False, print a summary only.
+    verbose: if True print full JSON. If False print a shorter summary only.
     """
 
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
-        print(f"{_GREEN}[LLMBridge]{_RESET} Initialised (stub mode — no LLM calls yet).")
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        print("[LLMBridge] Initialised in stub mode. No LLM calls yet.")
 
     def send(self, state: dict, snapshot_path: str) -> dict:
         """
-        Process one decision point.
+        Handle one decision point.
 
-        Parameters
-        ----------
-        state         : dict from SceneStateExtractor.capture()
-        snapshot_path : str  absolute path to the saved JPEG snapshot
+        state is the dict from SceneStateExtractor.capture().
+        snapshot_path is the absolute path to the saved snapshot image.
 
-        Returns
-        -------
-        response : dict  (stub — always returns empty plan for now)
+        Returns a stub dict until a real LLM is wired in.
         """
         self._print_state(state, snapshot_path)
         self._print_snapshot_info(snapshot_path)
 
-        # ── Placeholder for LLM call ─────────────────────────────────
-        # In the future this will:
-        #   1. Encode the snapshot as base64.
-        #   2. Combine it with the JSON state into a prompt.
-        #   3. Call the vision LLM API (e.g. GPT-4o, Gemini Pro Vision).
-        #   4. Parse the returned action plan.
-        #   5. Return structured action commands to nao_cam.py.
-        # ─────────────────────────────────────────────────────────────
+        # Placeholder until the real LLM is connected.
+        # Future steps will encode the image, build the prompt, call the API, and parse actions.
         response = {
-            "status":  "stub",
+            "status": "stub",
             "message": "LLM not yet connected.",
             "actions": [],
         }
-        print(f"\n{_DIM}[LLMBridge] → Response stub: {response}{_RESET}\n")
+        print(f"[LLMBridge] Response stub: {response}\n")
         return response
 
-    # ------------------------------------------------------------------
-    # Printing helpers
-    # ------------------------------------------------------------------
-
     def _print_state(self, state: dict, snapshot_path: str) -> None:
-        print(_header("SCENE STATE"))
+        print("\n[LLMBridge] SCENE STATE\n")
 
-        # ── Meta ──────────────────────────────────────────────────────
+        # When and why this capture happened.
         meta = state.get("meta", {})
-        print(f"{_BOLD}Trigger   :{_RESET} {meta.get('trigger', '?')}")
-        print(f"{_BOLD}Sim time  :{_RESET} {meta.get('sim_time_ms', 0) / 1000:.2f} s")
-        print(f"{_BOLD}Wall time :{_RESET} {meta.get('wall_time', '?')}")
-        print(f"{_BOLD}Frame     :{_RESET} {meta.get('frame_count', '?')}")
+        print(f"Trigger: {meta.get('trigger', '?')}")
+        print(f"Sim time: {meta.get('sim_time_ms', 0) / 1000:.2f} s")
+        print(f"Wall time: {meta.get('wall_time', '?')}")
+        print(f"Frame: {meta.get('frame_count', '?')}")
 
-        # ── Robot pose ────────────────────────────────────────────────
+        print("\n[LLMBridge] Robot pose and motion\n")
+
         robot = state.get("robot", {})
-        print(_header("Robot Pose & Motion"))
         ori = robot.get("orientation", {})
         if ori:
             print(
-                f"  Orientation  roll={ori.get('roll_deg','?'):>7.2f}°  "
-                f"pitch={ori.get('pitch_deg','?'):>7.2f}°  "
-                f"yaw={ori.get('yaw_deg','?'):>7.2f}°"
+                f"  Orientation roll={ori.get('roll_deg', '?'):>7.2f} deg "
+                f"pitch={ori.get('pitch_deg', '?'):>7.2f} deg "
+                f"yaw={ori.get('yaw_deg', '?'):>7.2f} deg"
             )
+
         acc = robot.get("acceleration", {})
         if acc:
             print(
-                f"  Accel (m/s²) x={acc.get('x_ms2',0):>8.4f}  "
-                f"y={acc.get('y_ms2',0):>8.4f}  "
-                f"z={acc.get('z_ms2',0):>8.4f}"
+                f"  Accel m per s squared x={acc.get('x_ms2', 0):>8.4f} "
+                f"y={acc.get('y_ms2', 0):>8.4f} z={acc.get('z_ms2', 0):>8.4f}"
             )
+
         gyro = robot.get("angular_velocity", {})
         if gyro:
             print(
-                f"  Gyro (rad/s) x={gyro.get('x_rads',0):>8.4f}  "
-                f"y={gyro.get('y_rads',0):>8.4f}  "
-                f"z={gyro.get('z_rads',0):>8.4f}"
+                f"  Gyro rad per s x={gyro.get('x_rads', 0):>8.4f} "
+                f"y={gyro.get('y_rads', 0):>8.4f} z={gyro.get('z_rads', 0):>8.4f}"
             )
+
         gps = robot.get("gps_position")
         if gps:
             print(
-                f"  GPS (m)      x={gps.get('x_m',0):>8.4f}  "
-                f"y={gps.get('y_m',0):>8.4f}  "
-                f"z={gps.get('z_m',0):>8.4f}"
+                f"  GPS meters x={gps.get('x_m', 0):>8.4f} "
+                f"y={gps.get('y_m', 0):>8.4f} z={gps.get('z_m', 0):>8.4f}"
             )
 
-        # ── Joints ────────────────────────────────────────────────────
+        # Joint angles in radians.
         joints = robot.get("joint_positions", {})
         if joints:
-            print(f"\n  {_BOLD}Joint positions (rad):{_RESET}")
+            print("\n  Joint positions in radians:")
             items = list(joints.items())
             for i in range(0, len(items), 3):
-                row = items[i:i+3]
+                row = items[i : i + 3]
                 print("  " + "   ".join(f"{k:<20} {v:>7.4f}" for k, v in row))
 
-        # ── Sensors ───────────────────────────────────────────────────
+        print("\n[LLMBridge] Sensors\n")
+
         sensors = state.get("sensors", {})
-        print(_header("Sensors"))
         sonar = sensors.get("sonar", {})
         if sonar:
             print(
-                f"  Sonar  left={sonar.get('left_m','N/A')} m  "
-                f"right={sonar.get('right_m','N/A')} m"
+                f"  Sonar left={sonar.get('left_m', 'N/A')} m "
+                f"right={sonar.get('right_m', 'N/A')} m"
             )
+
         touch = sensors.get("touch", {})
         if touch:
             active = [k for k, v in touch.items() if v]
-            print(f"  Touch  active={active if active else 'none'}")
+            print(f"  Touch active sensors: {active if active else 'none'}")
 
-        # ── Scene ─────────────────────────────────────────────────────
+        print("\n[LLMBridge] Detected objects\n")
+
         scene = state.get("scene", {})
         objects = scene.get("objects", [])
-        print(_header(f"Detected Objects  ({len(objects)} total)"))
+        print(f"Total objects: {len(objects)}")
+
         if not objects:
-            print(f"  {_DIM}No objects detected.{_RESET}")
+            print("  No objects detected.")
         else:
             for i, obj in enumerate(objects):
-                dist_str = (
-                    f"{obj['estimated_distance_m']:.2f} m"
-                    if obj.get("estimated_distance_m") is not None
-                    else obj.get("relative_distance", "unknown")
-                )
-                centred = "✓ centred" if obj.get("centred_in_frame") else ""
+                if obj.get("estimated_distance_m") is not None:
+                    dist_str = f"{obj['estimated_distance_m']:.2f} m"
+                else:
+                    dist_str = str(obj.get("relative_distance", "unknown"))
+
+                # True if the box is near the horizontal center of the image.
+                centred = "yes centred" if obj.get("centred_in_frame") else ""
+
                 print(
-                    f"  [{i+1}] {_YELLOW}{obj['label']:<20}{_RESET}"
-                    f"  conf={obj['confidence']:.2f}"
-                    f"  dist≈{dist_str:<10}"
-                    f"  angle={obj['horizontal_angle_deg']:>6.1f}°"
-                    f"  {centred}"
+                    f"  [{i + 1}] {obj['label']:<20} "
+                    f"conf={obj['confidence']:.2f} "
+                    f"dist about {dist_str:<10} "
+                    f"angle={obj['horizontal_angle_deg']:>6.1f} deg "
+                    f"{centred}"
                 )
 
-        # ── Full JSON (verbose mode) ───────────────────────────────────
         if self.verbose:
-            print(_header("Full JSON Payload"))
-            print(_DIM + json.dumps(state, indent=2, default=str) + _RESET)
+            print("\n[LLMBridge] Full JSON payload\n")
+            print(json.dumps(state, indent=2, default=str))
 
     def _print_snapshot_info(self, snapshot_path: str) -> None:
-        print(_header("Snapshot"))
+        print("\n[LLMBridge] Snapshot file\n")
+
         if os.path.isfile(snapshot_path):
             size_kb = os.path.getsize(snapshot_path) / 1024
-            print(f"  {_GREEN}Saved:{_RESET} {snapshot_path}  ({size_kb:.1f} KB)")
+            print(f"  Saved: {snapshot_path} ({size_kb:.1f} KB)")
         else:
-            print(f"  {_YELLOW}WARNING: snapshot file not found at {snapshot_path}{_RESET}")
+            print(f"  WARNING snapshot file not found: {snapshot_path}")
+
         print()
