@@ -1,104 +1,34 @@
-# ===========================================================================
-# Makefile — NAO YOLO Camera Controller
-# Run all targets from the root of the repository.
-# ===========================================================================
-
-# --- Paths ------------------------------------------------------------------
+# Webots NAO + YOLOv8 + LLM 
 WEBOTS_CONTROLLER := $(WEBOTS_HOME)/Contents/MacOS/webots-controller
-MODELS_DIR        := src/models
-SCRIPT            := src/nao_cam.py
-ROBOT_NAME        := NAO
-PORT              ?= 1234
+MODELS_DIR  := src/models
+ROBOT_NAME := NAO
+PORT           ?= 1234
+OLLAMA_MODEL   ?= llama3.2-vision
+GEMINI_MODEL   ?= gemini-2.5-flash
 
-# YOLO model URLs
-WEIGHTS_URL := https://pjreddie.com/media/files/yolov3.weights
-CFG_URL     := https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg
-NAMES_URL   := https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names
+.PHONY: all help simple models install pull-model clean
 
-# Model file paths
-WEIGHTS := $(MODELS_DIR)/yolov3.weights
-CFG     := $(MODELS_DIR)/yolov3.cfg
-NAMES   := $(MODELS_DIR)/coco.names
-
-# Ollama settings
-OLLAMA_MODEL ?= llama3.2-vision
-
-# ---------------------------------------------------------------------------
-.PHONY: all run models install pull-model serve clean help simple
-
-# Default target
 all: help
 
-# ---------------------------------------------------------------------------
-## run         — download models (if needed) then launch nao_cam + TaskPlanner.
-##               LLM default: Ollama. For Gemini API: TASK_PLANNER_BACKEND=gemini + GEMINI_API_KEY in .env
-run: models
-	@echo ">>> Starting NAO YOLO controller (robot=$(ROBOT_NAME), port=$(PORT))…"
-	@if [ -d .venv ]; then \
-		PATH="$(CURDIR)/.venv/bin:$$PATH" $(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) $(SCRIPT); \
-	else \
-		$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) $(SCRIPT); \
-	fi
-
-# ---------------------------------------------------------------------------
-## simple       — launch the new simple single-tool controller
-simple: models
-	@echo ">>> Starting NAO Simple controller (robot=$(ROBOT_NAME), port=$(PORT))…"
-	$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) src/simple_controller.py
-
-# ---------------------------------------------------------------------------
-## models      — download YOLO model files into src/models/ (skips if present)
-models: $(WEIGHTS) $(CFG) $(NAMES)
-
-$(MODELS_DIR):
-	mkdir -p $(MODELS_DIR)
-
-$(WEIGHTS): | $(MODELS_DIR)
-	@echo ">>> Downloading yolov3.weights (~237 MB)…"
-	curl -L --progress-bar -o $@ $(WEIGHTS_URL)
-
-$(CFG): | $(MODELS_DIR)
-	@echo ">>> Downloading yolov3.cfg…"
-	curl -L --silent -o $@ $(CFG_URL)
-
-$(NAMES): | $(MODELS_DIR)
-	@echo ">>> Downloading coco.names…"
-	curl -L --silent -o $@ $(NAMES_URL)
-
-# ---------------------------------------------------------------------------
-## install     — install Python dependencies from requirements.txt
-install:
-	@echo ">>> Installing Python dependencies…"
-	pip install -r requirements.txt
-
-# ---------------------------------------------------------------------------
-## pull-model  — download the Llama 3 model via Ollama (~5 GB for vision)
-pull-model:
-	@echo ">>> Pulling $(OLLAMA_MODEL) via Ollama…"
-	ollama pull $(OLLAMA_MODEL)
-
-# ---------------------------------------------------------------------------
-## serve       — start the Ollama server in the background
-serve:
-	@echo ">>> Starting Ollama server…"
-	ollama serve
-
-# ---------------------------------------------------------------------------
-## clean       — remove downloaded model files (keeps src/models/ directory)
-clean:
-	@echo ">>> Removing downloaded model files…"
-	rm -f $(WEIGHTS) $(CFG) $(NAMES)
-
-# ---------------------------------------------------------------------------
-## help        — show available targets (default)
 help:
 	@echo ""
-	@echo "  NAO YOLO Camera — available targets:"
+	@echo "  make simple   - run simple_controller.py (needs WEBOTS_HOME)"
+	@echo "  make models   - mkdir for Ultralytics weights (yolov8n.pt auto-downloads)"
+	@echo "  make install  - pip install -r requirements.txt"
+	@echo "  make pull-model - ollama pull $(OLLAMA_MODEL)"
 	@echo ""
-	@grep -E '^## ' Makefile | sed 's/## /    make /'
-	@echo ""
-	@echo "  Typical first-time setup:"
-	@echo "    make install   # install Python deps"
-	@echo "    make run       # downloads models then launches Webots controller"
-	@echo "    make run PORT=1235 # run on a specific port"
-	@echo ""
+
+models:
+	mkdir -p $(MODELS_DIR)
+
+simple: models
+	$(WEBOTS_CONTROLLER) --robot-name=$(ROBOT_NAME) --port=$(PORT) src/simple_controller.py
+
+install:
+	pip install -r requirements.txt
+
+pull-model:
+	ollama pull $(OLLAMA_MODEL)
+
+clean:
+	rm -f $(MODELS_DIR)/yolov3.weights $(MODELS_DIR)/yolov3.cfg $(MODELS_DIR)/coco.names

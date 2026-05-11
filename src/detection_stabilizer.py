@@ -1,8 +1,3 @@
-"""
-Temporal smoothing for YOLOv8 outputs: IoU-short-tracks + sliding-window label vote.
-
-Reduces alias / matching flicker when the classifier oscillates on a stable-looking box.
-"""
 
 from __future__ import annotations
 
@@ -11,34 +6,32 @@ from collections import Counter, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 
-def _iou_xywh(a: Tuple[float, ...], b: Tuple[float, ...]) -> float:
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    a_x2, a_y2 = ax + aw, ay + ah
-    b_x2, b_y2 = bx + bw, by + bh
-    ix1, iy1 = max(ax, bx), max(ay, by)
-    ix2, iy2 = min(a_x2, b_x2), min(a_y2, b_y2)
-    iw, ih = ix2 - ix1, iy2 - iy1
-    if iw <= 0 or ih <= 0:
+def overlap_between_boxes_xywh(box_a: Tuple[float, ...], box_b: Tuple[float, ...]) -> float:
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    a_right, a_bottom = ax + aw, ay + ah
+    b_right, b_bottom = bx + bw, by + bh
+    inter_left, inter_top = max(ax, bx), max(ay, by)
+    inter_right, inter_bottom = min(a_right, b_right), min(a_bottom, b_bottom)
+    inter_w, inter_h = inter_right - inter_left, inter_bottom - inter_top
+    if inter_w <= 0 or inter_h <= 0:
         return 0.0
-    inter = iw * ih
-    ua = aw * ah + bw * bh - inter
-    return float(inter / ua) if ua > 0 else 0.0
+    intersection_area = inter_w * inter_h
+    union_area = aw * ah + bw * bh - intersection_area
+    return float(intersection_area / union_area) if union_area > 0 else 0.0
 
 
-def _class_id_for_names(names: Optional[Dict[int, str]], label: str) -> int:
+def yolo_class_id_for_label(names: Optional[Dict[int, str]], label: str) -> int:
     if not names or not label:
         return -1
-    ll = str(label).lower().strip()
-    for cid, name in names.items():
-        if str(name).lower().strip() == ll:
-            return int(cid)
+    label_lower = str(label).lower().strip()
+    for class_id, class_name in names.items():
+        if str(class_name).lower().strip() == label_lower:
+            return int(class_id)
     return -1
 
 
 class _PassthroughStabilizer:
-    """``YOLO_STAB_WINDOW`` <= 0: passthrough, no state."""
-
     def __init__(self, names: Optional[Dict[int, str]] = None):
         self.names = names
 
@@ -50,17 +43,6 @@ class _PassthroughStabilizer:
 
 
 class DetectionStabilizer:
-    """
-    Associate per-frame detections to short-lived tracks (IoU). Each track keeps the last
-    ``window_size`` raw labels (``None`` when the track had no match that inference step).
-
-    Label for the current box:
-    - If the top-voted class appears at least ``min_hits`` times in the window → use it.
-    - Else if there are at least ``min_hits`` labeled samples in the window → use plurality
-      (dampens single-frame mislabels).
-    - Else use the current frame's raw label (cold start).
-    """
-
     def __init__(
         self,
         window_size: int = 10,
@@ -70,8 +52,8 @@ class DetectionStabilizer:
         names: Optional[Dict[int, str]] = None,
     ):
         self.window_size = max(1, int(window_size))
-        mh = max(1, int(min_hits))
-        self.min_hits = min(mh, self.window_size)
+        min_hits_clamped = max(1, int(min_hits))
+        self.min_hits = min(min_hits_clamped, self.window_size)
         self.iou_threshold = float(iou_threshold)
         self.max_miss = max(0, int(max_miss))
         self.names = names
@@ -79,11 +61,11 @@ class DetectionStabilizer:
 
     @classmethod
     def from_env(cls, names: Optional[Dict[int, str]] = None) -> Any:
-        w = int(os.getenv("YOLO_STAB_WINDOW", "10"))
-        if w <= 0:
+        window = int(os.getenv("YOLO_STAB_WINDOW", "10"))
+        if window <= 0:
             return _PassthroughStabilizer(names=names)
         return cls(
-            window_size=w,
+            window_size=window,
             min_hits=int(os.getenv("YOLO_STAB_MIN_HITS", "4")),
             iou_threshold=float(os.getenv("YOLO_STAB_IOU", "0.25")),
             max_miss=int(os.getenv("YOLO_STAB_MAX_MISS", "5")),
@@ -93,81 +75,87 @@ class DetectionStabilizer:
     def reset(self) -> None:
         self._tracks.clear()
 
-    def _vote_label(self, labels: Deque[Optional[str]], raw_label: str) -> str:
-        hist = [x for x in labels if x is not None]
-        if not hist:
-            return (raw_label or "").strip()
-        c = Counter(hist)
-        best, n_best = c.most_common(1)[0]
-        if n_best >= self.min_hits:
-            return str(best)
-        if len(hist) >= self.min_hits:
-            return str(best)
-        return (raw_label or str(best)).strip()
+    def _pick_label_from_history(
+        self, recent_labels: Deque[Optional[str]], current_frame_label: str
+    ) -> str:
+        labels_with_data = [x for x in recent_labels if x is not None]
+        if not labels_with_data:
+            return (current_frame_label or "").strip()
+        counts = Counter(labels_with_data)
+        top_label, top_count = counts.most_common(1)[0]
+        if top_count >= self.min_hits:
+            return str(top_label)
+        if len(labels_with_data) >= self.min_hits:
+            return str(top_label)
+        return (current_frame_label or str(top_label)).strip()
 
     def update(self, detections: List[dict]) -> List[dict]:
-        dets = list(detections)
-        used: set[int] = set()
-        matched_track_idx: set[int] = set()
+        frame_detections = list(detections)
+        used_detection_indices: set[int] = set()
+        matched_track_indices: set[int] = set()
 
-        for ti, tr in enumerate(self._tracks):
-            tb = tr["box"]
-            best_j = -1
-            best_iou = 0.0
-            for j, det in enumerate(dets):
-                if j in used:
+        for track_index, track in enumerate(self._tracks):
+            track_box = track["box"]
+            best_detection_index = -1
+            best_overlap = 0.0
+            for detection_index, detection in enumerate(frame_detections):
+                if detection_index in used_detection_indices:
                     continue
-                iou = _iou_xywh(tb, det["box"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_j = j
-            if best_j >= 0 and best_iou >= self.iou_threshold:
-                used.add(best_j)
-                matched_track_idx.add(ti)
-                det = dets[best_j]
-                lab = str(det.get("label", "") or "")
-                tr["labels"].append(lab)
-                tr["miss"] = 0
-                tr["raw"] = det
-                tr["box"] = tuple(int(x) for x in det["box"])
+                overlap = overlap_between_boxes_xywh(track_box, detection["box"])
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_detection_index = detection_index
+            if best_detection_index >= 0 and best_overlap >= self.iou_threshold:
+                used_detection_indices.add(best_detection_index)
+                matched_track_indices.add(track_index)
+                matched_detection = frame_detections[best_detection_index]
+                new_label = str(matched_detection.get("label", "") or "")
+                track["labels"].append(new_label)
+                track["miss"] = 0
+                track["last_detection"] = matched_detection
+                track["box"] = tuple(int(v) for v in matched_detection["box"])
 
-        for ti, tr in enumerate(self._tracks):
-            if ti in matched_track_idx:
+        for track_index, track in enumerate(self._tracks):
+            if track_index in matched_track_indices:
                 continue
-            tr["labels"].append(None)
-            tr["miss"] = int(tr.get("miss", 0)) + 1
+            track["labels"].append(None)
+            track["miss"] = int(track.get("miss", 0)) + 1
 
-        for j, det in enumerate(dets):
-            if j in used:
+        for detection_index, detection in enumerate(frame_detections):
+            if detection_index in used_detection_indices:
                 continue
-            lab = str(det.get("label", "") or "")
+            new_label = str(detection.get("label", "") or "")
             self._tracks.append(
                 {
-                    "box": tuple(int(x) for x in det["box"]),
-                    "labels": deque([lab], maxlen=self.window_size),
+                    "box": tuple(int(v) for v in detection["box"]),
+                    "labels": deque([new_label], maxlen=self.window_size),
                     "miss": 0,
-                    "raw": det,
+                    "last_detection": detection,
                 }
             )
 
         if self.max_miss > 0:
-            self._tracks = [t for t in self._tracks if int(t.get("miss", 0)) <= self.max_miss]
+            self._tracks = [
+                track_record
+                for track_record in self._tracks
+                if int(track_record.get("miss", 0)) <= self.max_miss
+            ]
 
-        out: List[dict] = []
-        for tr in self._tracks:
-            if int(tr.get("miss", 0)) != 0:
+        stabilized_output: List[dict] = []
+        for track in self._tracks:
+            if int(track.get("miss", 0)) != 0:
                 continue
-            raw = tr["raw"]
-            if not isinstance(raw, dict):
+            last_detection = track["last_detection"]
+            if not isinstance(last_detection, dict):
                 continue
-            raw_lab = str(raw.get("label", "") or "")
-            voted = self._vote_label(tr["labels"], raw_lab)
-            if not voted:
-                voted = raw_lab
-            d = dict(raw)
-            d["label"] = voted
-            cid = _class_id_for_names(self.names, voted)
-            if cid >= 0:
-                d["class_id"] = cid
-            out.append(d)
-        return out
+            raw_label = str(last_detection.get("label", "") or "")
+            stable_label = self._pick_label_from_history(track["labels"], raw_label)
+            if not stable_label:
+                stable_label = raw_label
+            output_detection = dict(last_detection)
+            output_detection["label"] = stable_label
+            class_id = yolo_class_id_for_label(self.names, stable_label)
+            if class_id >= 0:
+                output_detection["class_id"] = class_id
+            stabilized_output.append(output_detection)
+        return stabilized_output

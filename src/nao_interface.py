@@ -1,15 +1,3 @@
-"""
-NaoInterface — NAO control wrapper for Webots.
-
-Locomotion uses the built-in Webots NAO Motion files when available:
-  - Forwards.motion
-  - Backwards.motion
-  - TurnLeft60.motion
-  - TurnRight60.motion
-
-Head and arm joints are controlled directly with setPosition().
-Also exposes get_gps_position() for debugging whether the robot is physically moving.
-"""
 
 import os
 import math
@@ -93,7 +81,7 @@ class NaoInterface:
         self._motions = {}
         self._active_motion_key = None
         self._active_motion = None
-        self._walk_fast_vx_thr = float(os.environ.get("NAO_WALK_FAST_VX_THRESHOLD", "0.08"))
+        self._walk_fast_vx_thr = float(os.getenv("NAO_WALK_FAST_VX_THRESHOLD", "0.08"))
         self._try_load_motions()
 
         print(
@@ -101,10 +89,6 @@ class NaoInterface:
             f"{len(self._motions)} motion files "
             f"(HeadPitch clamp [{self._head_pitch_min:.3f}, {self._head_pitch_max:.3f}] rad)"
         )
-
-    # ------------------------------------------------------------------
-    # Motion file loading
-    # ------------------------------------------------------------------
 
     def _try_load_motions(self):
         try:
@@ -146,7 +130,11 @@ class NaoInterface:
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "motions"),
         ]
 
-        motions_dir = next((d for d in candidate_dirs if os.path.isdir(d)), None)
+        motions_dir = None
+        for path in candidate_dirs:
+            if path and os.path.isdir(path):
+                motions_dir = path
+                break
 
         if not motions_dir:
             print("[NaoInterface] ERROR: NAO motion directory not found")
@@ -179,17 +167,14 @@ class NaoInterface:
 
         print(f"[NaoInterface] Motion files loaded: {sorted(self._motions.keys())}")
 
-        ff = "forward_fast" in self._motions
-        std = os.environ.get("NAO_FORWARD_PROFILE", "standard").lower() != "fast"
+        has_fast_forward_motion = "forward_fast" in self._motions
+        prefer_standard_forward_profile = os.environ.get("NAO_FORWARD_PROFILE", "standard").lower() != "fast"
+
         print(
             f"[NaoInterface] Forward walk: "
-            f"{'Forwards50 (fast)' if ff and not std else 'Forwards (default)'} "
+            f"{'Forwards50 (fast)' if has_fast_forward_motion and not prefer_standard_forward_profile else 'Forwards (default)'} "
             f"(set NAO_FORWARD_PROFILE=fast for Forwards50.motion)"
         )
-
-    # ------------------------------------------------------------------
-    # GPS debug
-    # ------------------------------------------------------------------
 
     def get_gps_position(self):
         try:
@@ -199,10 +184,6 @@ class NaoInterface:
             return tuple(round(float(v), 4) for v in values)
         except Exception:
             return None
-
-    # ------------------------------------------------------------------
-    # Locomotion
-    # ------------------------------------------------------------------
 
     def _play_motion(self, key: str, loop: bool = True):
         motion = self._motions.get(key)
@@ -248,7 +229,7 @@ class NaoInterface:
             self._play_motion("backward", loop=True)
             return
 
-        use_fast = (
+        use_fast = (  # optional Forwards50.motion
             os.environ.get("NAO_FORWARD_PROFILE", "standard").lower() == "fast"
             and float(vx) >= self._walk_fast_vx_thr
             and "forward_fast" in self._motions
@@ -267,7 +248,6 @@ class NaoInterface:
             self._play_motion("turn_right", loop=True)
 
     def stop_locomotion_only(self):
-        """Stop walk/turn motions only — no Stand / go_to_rest (keeps head pose)."""
         if self._active_motion is not None:
             try:
                 self._active_motion.stop()
@@ -289,12 +269,7 @@ class NaoInterface:
 
         print("[NaoInterface] stopped")
 
-    # ------------------------------------------------------------------
-    # Head control
-    # ------------------------------------------------------------------
-
     def reset_head_neutral(self):
-        """Head straight ahead / level — use during search before the target is confirmed."""
         self.set_head_yaw(0.0)
         self.set_head_pitch(0.0)
 
@@ -319,7 +294,6 @@ class NaoInterface:
         self.set_head_yaw(self._head_yaw + float(delta))
 
     def adjust_head_pitch(self, delta: float):
-        """Positive delta tilts head down (camera toward floor); negative looks up."""
         self.set_head_pitch(self._head_pitch + float(delta))
 
     def get_head_pitch(self) -> float:
@@ -335,11 +309,6 @@ class NaoInterface:
         pitch_gain: Optional[float] = None,
         cy_deadband: Optional[float] = None,
     ) -> None:
-        """
-        Adjust head **pitch only** from vertical image position (0=top, 1=bottom).
-        Yaw is unchanged. When ``cy_norm`` is within ``cy_deadband`` of image center (0.5),
-        target pitch is level (0 rad). Pitch is clamped to HeadPitch joint limits.
-        """
         cy_norm = max(0.0, min(1.0, float(cy_norm)))
         db = 0.04 if cy_deadband is None else max(0.0, float(cy_deadband))
         pg = 0.3 if pitch_gain is None else max(0.05, float(pitch_gain))
@@ -364,13 +333,6 @@ class NaoInterface:
         pitch_gain: Optional[float] = None,
         floor_pitch_boost: Optional[float] = None,
     ):
-        """
-        Point head toward normalized image coords (0–1). x: left=0, right=1; y: top=0, bottom=1.
-        Low y = object high in frame (look up); high y = object low / on floor (look down).
-
-        ``pitch_gain`` scales vertical aiming (default 0.3; use ~0.55–0.75 when following ground objects).
-        ``floor_pitch_boost`` extra downward bias when cy_norm > 0.5 (rad, added to desired pitch).
-        """
         cx_norm = max(0.0, min(1.0, float(cx_norm)))
         cy_norm = max(0.0, min(1.0, float(cy_norm)))
 
@@ -391,10 +353,6 @@ class NaoInterface:
 
         self.set_head_yaw(new_yaw)
         self.set_head_pitch(new_pitch)
-
-    # ------------------------------------------------------------------
-    # Joint / pose control
-    # ------------------------------------------------------------------
 
     def set_joint(self, name: str, angle: float):
         self._set(name, angle)

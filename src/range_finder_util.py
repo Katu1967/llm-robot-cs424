@@ -1,9 +1,3 @@
-"""
-range_finder_util.py — Read Webots RangeFinder depth buffers and build BGR previews.
-
-Used by ``SceneStateExtractor`` (per-object depth) and ``simple_controller`` (live HUD).
-Handles ``getRangeImage(data_type='list')`` and raw float ``bytes`` buffers (google-genai era Webots).
-"""
 
 from __future__ import annotations
 
@@ -18,65 +12,65 @@ def default_range_finder_name() -> str:
     return (os.environ.get("NAO_RANGE_FINDER_NAME") or "HeadRangeFinder").strip()
 
 
-def read_range_depth_hw(rf: Any) -> Optional[np.ndarray]:
-    """
-    Return depth in metres as ``float32`` array shape ``(H, W)``, or ``None``.
-
-    Webots returns ``inf`` outside ``[minRange, maxRange]``; those values are kept
-    so callers can mask them consistently.
-    """
-    if rf is None:
+def read_range_depth_hw(range_finder_device: Any) -> Optional[np.ndarray]:
+    if range_finder_device is None:
         return None
+
     try:
-        w = int(rf.getWidth())
-        h = int(rf.getHeight())
+        width = int(range_finder_device.getWidth())
+        height = int(range_finder_device.getHeight())
     except Exception:
         return None
-    if w <= 0 or h <= 0:
+
+    if width <= 0 or height <= 0:
         return None
-    n = w * h
-    raw: Any = None
+
+    pixel_count = width * height
+    raw_buffer: Any = None
+
     try:
-        raw = rf.getRangeImage(data_type="list")
+        raw_buffer = range_finder_device.getRangeImage(data_type="list")
     except TypeError:
         try:
-            raw = rf.getRangeImage()
+            raw_buffer = range_finder_device.getRangeImage()
         except Exception:
-            raw = None
+            raw_buffer = None
     except Exception:
         try:
-            raw = rf.getRangeImage()
+            raw_buffer = range_finder_device.getRangeImage()
         except Exception:
-            raw = None
+            raw_buffer = None
 
-    if raw is None:
+    if raw_buffer is None:
         try:
-            raw = rf.getLayerRangeImage(0)
+            raw_buffer = range_finder_device.getLayerRangeImage(0)
         except Exception:
             return None
-    if raw is None:
+    if raw_buffer is None:
         return None
 
-    arr = _coerce_raw_to_hw_float32(raw, w, h, n)
-    return arr
+    return buffer_to_depth_hw_float32(raw_buffer, width, height, pixel_count)
 
 
-def _coerce_raw_to_hw_float32(raw: Any, w: int, h: int, n: int) -> Optional[np.ndarray]:
-    if isinstance(raw, (bytes, bytearray, memoryview)):
-        buf = np.frombuffer(bytes(raw), dtype=np.float32, count=n)
-        if buf.size != n:
-            return None
-        return buf.reshape((h, w)).copy()
+def buffer_to_depth_hw_float32(raw_depth_buffer: Any, width: int, height: int, pixel_count: int) -> Optional[np.ndarray]:
+    if isinstance(raw_depth_buffer, (bytes, bytearray, memoryview)):
+        flat = np.frombuffer(bytes(raw_depth_buffer), dtype=np.float32, count=pixel_count)
 
-    if hasattr(raw, "__len__"):
-        ln = len(raw)
-        if ln < n:
+        if flat.size != pixel_count:
             return None
-        # list or array-like of floats
-        flat = np.asarray(raw[:n], dtype=np.float32)
-        if flat.size != n:
+
+        return flat.reshape((height, width)).copy()
+
+    if hasattr(raw_depth_buffer, "__len__"):
+        if len(raw_depth_buffer) < pixel_count:
             return None
-        return flat.reshape((h, w))
+
+        flat = np.asarray(raw_depth_buffer[:pixel_count], dtype=np.float32)
+
+        if flat.size != pixel_count:
+            return None
+
+        return flat.reshape((height, width))
 
     return None
 
@@ -88,29 +82,26 @@ def depth_hw_to_bgr_vis(
     *,
     colormap: int | None = None,
 ) -> np.ndarray:
-    """
-    Normalise finite depths in ``[min_m, max_m]`` to a colour-mapped BGR image (HxW x 3).
-    """
     cmap = colormap if colormap is not None else getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)
 
-    d = depth_hw.astype(np.float32, copy=False)
-    finite = np.isfinite(d)
-    out = np.zeros((d.shape[0], d.shape[1], 3), dtype=np.uint8)
-    if not np.any(finite):
-        return out
+    depth = depth_hw.astype(np.float32, copy=False)
+    finite_mask = np.isfinite(depth)
+    output_bgr = np.zeros((depth.shape[0], depth.shape[1], 3), dtype=np.uint8)
+    if not np.any(finite_mask):
+        return output_bgr
 
     lo = float(min_m)
     hi = float(max_m)
     if hi <= lo:
         hi = lo + 1e-3
 
-    norm = np.zeros_like(d, dtype=np.float32)
-    m = finite & (d >= lo) & (d <= hi)
-    norm[m] = (d[m] - lo) / (hi - lo)
-    norm = np.clip(norm, 0.0, 1.0)
-    u8 = (norm * 255.0).astype(np.uint8)
+    normalized = np.zeros_like(depth, dtype=np.float32)
+    in_range = finite_mask & (depth >= lo) & (depth <= hi)
+    normalized[in_range] = (depth[in_range] - lo) / (hi - lo)
+    normalized = np.clip(normalized, 0.0, 1.0)
+    gray_u8 = (normalized * 255.0).astype(np.uint8)
 
-    return cv2.applyColorMap(u8, cmap)
+    return cv2.applyColorMap(gray_u8, cmap)
 
 
 def median_depth_in_camera_box(
@@ -126,26 +117,26 @@ def median_depth_in_camera_box(
     max_m: float = 10.0,
     shrink: float = 0.20,
 ) -> Optional[float]:
-    """Median valid depth inside a camera-pixel bbox mapped onto ``depth_hw`` resolution."""
-    rf_h, rf_w = depth_hw.shape[:2]
-    if cam_w <= 0 or cam_h <= 0 or rf_w <= 0 or rf_h <= 0:
+    depth_height, depth_width = depth_hw.shape[:2]
+
+    if cam_w <= 0 or cam_h <= 0 or depth_width <= 0 or depth_height <= 0:
         return None
 
-    sx = box_x + box_w * shrink
-    sy = box_y + box_h * shrink
-    sw = box_w * (1.0 - 2.0 * shrink)
-    sh = box_h * (1.0 - 2.0 * shrink)
+    inner_x = box_x + box_w * shrink
+    inner_y = box_y + box_h * shrink
+    inner_w = box_w * (1.0 - 2.0 * shrink)
+    inner_h = box_h * (1.0 - 2.0 * shrink)
 
-    x1 = int(max(0, sx / cam_w * rf_w))
-    y1 = int(max(0, sy / cam_h * rf_h))
-    x2 = int(min(rf_w, (sx + sw) / cam_w * rf_w))
-    y2 = int(min(rf_h, (sy + sh) / cam_h * rf_h))
+    x1 = int(max(0, inner_x / cam_w * depth_width))
+    y1 = int(max(0, inner_y / cam_h * depth_height))
+    x2 = int(min(depth_width, (inner_x + inner_w) / cam_w * depth_width))
+    y2 = int(min(depth_height, (inner_y + inner_h) / cam_h * depth_height))
     if x2 <= x1 or y2 <= y1:
         return None
 
     patch = depth_hw[y1:y2, x1:x2]
-    valid = patch[np.isfinite(patch)]
-    valid = valid[(valid > min_m) & (valid < max_m)]
-    if valid.size == 0:
+    finite_values = patch[np.isfinite(patch)]
+    finite_values = finite_values[(finite_values > min_m) & (finite_values < max_m)]
+    if finite_values.size == 0:
         return None
-    return round(float(np.median(valid)), 3)
+    return round(float(np.median(finite_values)), 3)
