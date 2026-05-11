@@ -1,14 +1,9 @@
 """
-NaoInterface — NAO control wrapper for Webots.
+NaoInterface is a thin wrapper around Webots NAO control.
 
-Locomotion uses the built-in Webots NAO Motion files when available:
-  - Forwards.motion
-  - Backwards.motion
-  - TurnLeft60.motion
-  - TurnRight60.motion
+Walk and turn use Webots Motion files when present such as Forwards motion and TurnLeft60 motion.
 
-Head and arm joints are controlled directly with setPosition().
-Also exposes get_gps_position() for debugging whether the robot is physically moving.
+Head and arms use Motor setPosition. get_gps_position helps debug whether the robot moved.
 """
 
 import os
@@ -55,9 +50,11 @@ class NaoInterface:
 
         self._head_yaw = 0.0
         self._head_pitch = 0.0
-        # Skip tiny setPosition deltas to reduce head jitter (rad).
+
+        # Ignore tiny head commands so the head does not jitter in radians.
         self._head_cmd_min = float(os.getenv("NAO_HEAD_CMD_MIN_RAD", "0.012"))
-        # HeadPitch joint limits from Webots (avoid "too big requested position" warnings).
+
+        # Head pitch limits from Webots so we do not request impossible angles.
         self._head_pitch_min = -0.67
         self._head_pitch_max = 0.51
 
@@ -73,6 +70,7 @@ class NaoInterface:
                         pass
                     if name == "HeadPitch":
                         try:
+                            # Prefer limits read from the actual joint device.
                             self._head_pitch_min = float(motor.getMinPosition())
                             self._head_pitch_max = float(motor.getMaxPosition())
                         except Exception:
@@ -97,15 +95,12 @@ class NaoInterface:
         self._try_load_motions()
 
         print(
-            f"[NaoInterface] ready — {len(self._motors)} joints, "
+            f"[NaoInterface] ready with {len(self._motors)} joints and "
             f"{len(self._motions)} motion files "
             f"(HeadPitch clamp [{self._head_pitch_min:.3f}, {self._head_pitch_max:.3f}] rad)"
         )
 
-    # ------------------------------------------------------------------
-    # Motion file loading
-    # ------------------------------------------------------------------
-
+    # Load walk and turn clips from disk paths that Webots ships with the NAO model.
     def _try_load_motions(self):
         try:
             from controller import Motion
@@ -115,6 +110,7 @@ class NaoInterface:
 
         candidate_dirs = []
 
+        # WEBOTS_HOME may point at the app bundle root or the install root.
         webots_home = os.environ.get("WEBOTS_HOME", "")
         if webots_home:
             candidate_dirs.append(
@@ -187,10 +183,7 @@ class NaoInterface:
             f"(set NAO_FORWARD_PROFILE=fast for Forwards50.motion)"
         )
 
-    # ------------------------------------------------------------------
-    # GPS debug
-    # ------------------------------------------------------------------
-
+    # Read GPS values for debugging motion in the world.
     def get_gps_position(self):
         try:
             if self._gps is None:
@@ -200,10 +193,7 @@ class NaoInterface:
         except Exception:
             return None
 
-    # ------------------------------------------------------------------
-    # Locomotion
-    # ------------------------------------------------------------------
-
+    # Walk and turn using Webots Motion clips.
     def _play_motion(self, key: str, loop: bool = True):
         motion = self._motions.get(key)
 
@@ -211,9 +201,11 @@ class NaoInterface:
             print(f"[NaoInterface] missing motion '{key}'")
             return False
 
+        # Already playing this clip so nothing to do.
         if self._active_motion_key == key:
             return True
 
+        # Stop the previous clip before starting a new one.
         if self._active_motion is not None:
             try:
                 self._active_motion.stop()
@@ -237,6 +229,7 @@ class NaoInterface:
             return False
 
     def start_walk(self, vx: float = 0.0, vy: float = 0.0, omega: float = 0.0):
+        # Large omega means in place turn not forward walk.
         if abs(omega) > 0.30:
             if omega > 0:
                 self._play_motion("turn_left", loop=True)
@@ -248,6 +241,7 @@ class NaoInterface:
             self._play_motion("backward", loop=True)
             return
 
+        # Optional faster forward clip when env asks for fast profile and speed is high enough.
         use_fast = (
             os.environ.get("NAO_FORWARD_PROFILE", "standard").lower() == "fast"
             and float(vx) >= self._walk_fast_vx_thr
@@ -267,7 +261,7 @@ class NaoInterface:
             self._play_motion("turn_right", loop=True)
 
     def stop_locomotion_only(self):
-        """Stop walk/turn motions only — no Stand / go_to_rest (keeps head pose)."""
+        """Stop walk and turn only. Does not play stand or rest so head pose stays."""
         if self._active_motion is not None:
             try:
                 self._active_motion.stop()
@@ -278,6 +272,8 @@ class NaoInterface:
 
     def stop_walk(self):
         self.stop_locomotion_only()
+
+        # Prefer stand motion if the file exists so the robot settles upright.
         if "stand" in self._motions:
             try:
                 self._motions["stand"].setLoop(False)
@@ -289,17 +285,16 @@ class NaoInterface:
 
         print("[NaoInterface] stopped")
 
-    # ------------------------------------------------------------------
-    # Head control
-    # ------------------------------------------------------------------
-
+    # Head joints only here. Arms stay unless other methods move them.
     def reset_head_neutral(self):
-        """Head straight ahead / level — use during search before the target is confirmed."""
+        """Head level and straight ahead. Good while searching before lock on."""
         self.set_head_yaw(0.0)
         self.set_head_pitch(0.0)
 
     def set_head_yaw(self, angle: float):
         angle = max(-2.08, min(2.08, float(angle)))
+
+        # Skip send if the change is smaller than the deadband.
         if abs(angle - self._head_yaw) < self._head_cmd_min:
             self._head_yaw = angle
             return
@@ -309,6 +304,7 @@ class NaoInterface:
     def set_head_pitch(self, angle: float):
         mn, mx = self._head_pitch_min, self._head_pitch_max
         angle = max(mn, min(mx, float(angle)))
+
         if abs(angle - self._head_pitch) < self._head_cmd_min:
             self._head_pitch = angle
             return
@@ -336,9 +332,11 @@ class NaoInterface:
         cy_deadband: Optional[float] = None,
     ) -> None:
         """
-        Adjust head **pitch only** from vertical image position (0=top, 1=bottom).
-        Yaw is unchanged. When ``cy_norm`` is within ``cy_deadband`` of image center (0.5),
-        target pitch is level (0 rad). Pitch is clamped to HeadPitch joint limits.
+        Change pitch only from vertical position in the image. Top is zero and bottom is one.
+
+        Yaw does not move. If cy_norm is near image center half the target pitch is zero.
+
+        Pitch is clamped to Webots HeadPitch limits.
         """
         cy_norm = max(0.0, min(1.0, float(cy_norm)))
         db = 0.04 if cy_deadband is None else max(0.0, float(cy_deadband))
@@ -351,6 +349,7 @@ class NaoInterface:
         mn, mx = self._head_pitch_min, self._head_pitch_max
         desired_pitch = max(mn, min(mx, desired_pitch))
 
+        # Low pass toward desired pitch so motion stays smooth.
         a = 0.08 if alpha is None else max(0.01, min(1.0, float(alpha)))
         new_pitch = self._head_pitch + a * (desired_pitch - self._head_pitch)
         new_pitch = max(mn, min(mx, new_pitch))
@@ -365,11 +364,11 @@ class NaoInterface:
         floor_pitch_boost: Optional[float] = None,
     ):
         """
-        Point head toward normalized image coords (0–1). x: left=0, right=1; y: top=0, bottom=1.
-        Low y = object high in frame (look up); high y = object low / on floor (look down).
+        Aim head at normalised image coords from zero to one on x and y.
 
-        ``pitch_gain`` scales vertical aiming (default 0.3; use ~0.55–0.75 when following ground objects).
-        ``floor_pitch_boost`` extra downward bias when cy_norm > 0.5 (rad, added to desired pitch).
+        Low y means target is high in the frame so we look up. High y means lower in the frame.
+
+        pitch_gain scales how strong vertical aim is. floor_pitch_boost adds extra down bias when the target is in the lower half of the image.
         """
         cx_norm = max(0.0, min(1.0, float(cx_norm)))
         cy_norm = max(0.0, min(1.0, float(cy_norm)))
@@ -385,6 +384,7 @@ class NaoInterface:
 
         a = 0.08 if alpha is None else max(0.01, min(1.0, float(alpha)))
 
+        # Smooth both yaw and pitch toward the target angles.
         new_yaw = self._head_yaw + a * (desired_yaw - self._head_yaw)
         new_pitch = self._head_pitch + a * (desired_pitch - self._head_pitch)
         new_pitch = max(mn, min(mx, new_pitch))
@@ -392,10 +392,7 @@ class NaoInterface:
         self.set_head_yaw(new_yaw)
         self.set_head_pitch(new_pitch)
 
-    # ------------------------------------------------------------------
-    # Joint / pose control
-    # ------------------------------------------------------------------
-
+    # Direct joint targets for arms and legs.
     def set_joint(self, name: str, angle: float):
         self._set(name, angle)
 

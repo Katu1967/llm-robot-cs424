@@ -1,26 +1,15 @@
 """
-gemini_llm_connector.py — Call Google Gemini with the same planner prompt/shape as SimplePlanner.
+Call Google Gemini with the same planner text shape as SimplePlanner.
 
-Uses the official Google Gen AI SDK (``google-genai``), not the legacy
-``google-generativeai`` package.
+Uses the official google-genai Python package. Not the older google-generativeai package.
 
-Environment
------------
-GEMINI_API_KEY (required)
-    Create a key in Google AI Studio: https://aistudio.google.com/apikey
+Environment variables:
+GEMINI_API_KEY or GOOGLE_API_KEY is required.
+GEMINI_MODEL is optional. If unset the code uses gemini 2.0 flash.
 
-GEMINI_MODEL (optional)
-    Model id, e.g. ``gemini-2.0-flash``, ``gemini-2.5-flash``. Defaults to
-    ``gemini-2.0-flash`` if unset.
+Install with pip install google-genai.
 
-Install
--------
-    pip install google-genai
-
-Typical use
------------
-Set ``SIMPLE_PLANNER_BACKEND=gemini`` and run the simple controller as usual, or call
-``gemini_plan_from_scene(...)`` from your own code.
+Typical use is to set the planner backend to gemini in env and run the simple controller or call gemini_plan_from_scene from your code.
 """
 
 from __future__ import annotations
@@ -28,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any, Optional
 
 try:
@@ -47,10 +37,12 @@ _DEFAULT_MODEL = "gemini-2.0-flash"
 
 def _resolve_api_key(explicit: Optional[str]) -> str:
     key = (explicit or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+
     if not key:
         raise ValueError(
-            "Missing API key: set GEMINI_API_KEY (or GOOGLE_API_KEY) in the environment."
+            "Missing API key: set GEMINI_API_KEY or GOOGLE_API_KEY in the environment."
         )
+
     return key
 
 
@@ -58,16 +50,41 @@ def _resolve_model(explicit: Optional[str]) -> str:
     return (explicit or os.getenv("GEMINI_MODEL") or _DEFAULT_MODEL).strip()
 
 
+def _is_http_503(exc: BaseException) -> bool:
+    """True when the error looks like HTTP 503 service unavailable."""
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(exc, "code", None)
+    if code == 503:
+        return True
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        sc = getattr(response, "status_code", None)
+        if sc == 503:
+            return True
+
+    msg = str(exc).lower()
+    if "503" in msg or "service unavailable" in msg:
+        return True
+
+    return False
+
+
 def extract_json_plan(raw: str) -> Optional[dict[str, Any]]:
     """
-    Parse a planner JSON object from model output (fences or first {...} block).
-    Same behavior as SimplePlanner._call_llm post-processing.
+    Pull one JSON object from model text.
+
+    Accepts markdown code fences or the first brace block. Same idea as SimplePlanner post processing.
     """
     raw = (raw or "").strip()
+
     if not raw:
         return None
 
     json_str: Optional[str] = None
+
+    # Try fenced json first since many models wrap output that way.
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
     if fence_match:
         json_str = fence_match.group(1).strip()
@@ -78,6 +95,7 @@ def extract_json_plan(raw: str) -> Optional[dict[str, Any]]:
 
     if not json_str:
         return None
+
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
@@ -85,10 +103,12 @@ def extract_json_plan(raw: str) -> Optional[dict[str, Any]]:
 
 
 def _response_text(response: Any) -> str:
-    """Best-effort text extraction for google-genai responses."""
+    # Prefer the convenience text field if the SDK filled it.
     text = getattr(response, "text", None)
     if text:
         return str(text).strip()
+
+    # Otherwise stitch candidate parts manually.
     try:
         parts = response.candidates[0].content.parts
         return "".join(getattr(p, "text", "") or "" for p in parts).strip()
@@ -100,8 +120,10 @@ def _load_pil_image(path: str):
     from PIL import Image
 
     img = Image.open(path)
+
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGB")
+
     return img
 
 
@@ -114,12 +136,10 @@ def gemini_generate_content(
     api_key: Optional[str] = None,
 ) -> str:
     """
-    Send one user turn (optional camera image + text) to Gemini; return raw text.
-
-    Parameters mirror the planner: system instruction + user blob + optional JPEG/PNG path.
+    Send one user turn with optional snapshot image plus text. Returns raw model text.
     """
     if not _GEMINI_SDK_AVAILABLE:
-        raise ImportError("Gemini SDK not installed. Run: pip install google-genai")
+        raise ImportError("Gemini SDK not installed. Run pip install google-genai")
 
     key = _resolve_api_key(api_key)
     mdl = _resolve_model(model)
@@ -128,6 +148,7 @@ def gemini_generate_content(
     client = _genai.Client(api_key=key)
 
     contents: list = []
+
     if snapshot_path and os.path.isfile(snapshot_path):
         try:
             contents.append(_load_pil_image(snapshot_path))
@@ -137,12 +158,27 @@ def gemini_generate_content(
 
     contents.append(user_text)
 
-    response = client.models.generate_content(
-        model=mdl,
-        contents=contents,
-        config=_genai_types.GenerateContentConfig(system_instruction=sys_instr),
-    )
-    return _response_text(response)
+    # Retry a few times on 503 because the service can be briefly overloaded.
+    max_attempts = max(1, int(os.getenv("GEMINI_503_MAX_ATTEMPTS", "5")))
+    retry_delay_s = max(0.0, float(os.getenv("GEMINI_503_RETRY_DELAY_S", "2.0")))
+
+    for attempt in range(max_attempts):
+        try:
+            response = client.models.generate_content(
+                model=mdl,
+                contents=contents,
+                config=_genai_types.GenerateContentConfig(system_instruction=sys_instr),
+            )
+            return _response_text(response)
+        except Exception as err:
+            if not _is_http_503(err) or attempt >= max_attempts - 1:
+                raise
+
+            print(
+                f"[gemini_llm_connector] Gemini unavailable 503 "
+                f"attempt {attempt + 1} of {max_attempts} retry in {retry_delay_s:.1f} s"
+            )
+            time.sleep(retry_delay_s)
 
 
 def gemini_plan_from_scene(
@@ -156,13 +192,16 @@ def gemini_plan_from_scene(
     api_key: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """
-    One planning step: same inputs as ``SimplePlanner._call_llm`` → parsed plan dict
-    (``action``, ``aliases``, …) or ``None`` on failure.
+    One planning step like SimplePlanner call LLM but through Gemini.
+
+    Returns the parsed plan dict or None on failure.
     """
     try:
         user_text = build_planner_user_text(goal, scene_state, context)
         mdl = _resolve_model(model)
-        print(f"[gemini_llm_connector] Calling Gemini model={mdl!r}…")
+
+        print(f"[gemini_llm_connector] Calling Gemini model={mdl!r}")
+
         raw = gemini_generate_content(
             user_text,
             system_instruction=system_instruction,
@@ -170,29 +209,36 @@ def gemini_plan_from_scene(
             model=model,
             api_key=api_key,
         )
+
         print(f"[gemini_llm_connector] Raw response ({len(raw)} chars):\n{raw[:400]}")
 
         plan = extract_json_plan(raw)
+
         if plan is None:
-            print("[gemini_llm_connector] ERROR: No valid JSON plan in response.")
+            print("[gemini_llm_connector] ERROR no valid JSON plan in response.")
         else:
             print(f"[gemini_llm_connector] Parsed action: {plan.get('action')!r}")
+
         return plan
+
     except ValueError as e:
         print(f"[gemini_llm_connector] Config error: {e}")
         return None
+
     except ImportError as e:
         print(f"[gemini_llm_connector] {e}")
         return None
+
     except Exception as e:
         print(f"[gemini_llm_connector] Gemini error: {e}")
         return None
 
 
 def gemini_available() -> bool:
-    """True if ``google-genai`` is importable and ``GEMINI_API_KEY`` (or ``GOOGLE_API_KEY``) is set."""
+    """True if the SDK imports and an API key is set."""
     if not _GEMINI_SDK_AVAILABLE:
         return False
+
     try:
         _resolve_api_key(None)
         return True
