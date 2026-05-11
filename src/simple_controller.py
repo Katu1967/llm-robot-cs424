@@ -163,24 +163,18 @@ def main():
                 try:
                     if dm is not None:
                         m = float(dm)
-                        ft_line = (
-                            f" Final RangeFinder distance ≈ {_meters_to_feet(m):.2f} ft "
-                            f"({m:.3f} m)."
-                        )
+                        ft_line = f" Final RangeFinder distance ≈ {_meters_to_feet(m):.2f} ft ({m:.3f} m)."
                 except (TypeError, ValueError):
                     pass
-            print(
-                "[simple_controller] Final approach (SUPER_CLOSE) — "
-                "vision threshold met; completing goal." + ft_line
-            )
-            print("[simple_controller] Goal complete — press SPACE for a new goal.\n")
-            goal_active = False
-            goal_prompted = False
+            print("[simple_controller] Final approach (SUPER_CLOSE) met. Asking LLM for next step..." + ft_line)
+            
+            # Keep these resets, but DO NOT clear goal_active or planner.set_goal
             search_mode[0] = False
             search_aliases.clear()
             nav_locate_complete[0] = False
-            planner.set_goal("")
-            return
+            
+            # The return statement has been removed here so it successfully falls through to planner.request_plan()
+            
         ctx = merge_object_in_view_context(context)
         if approach_active[0] and context.startswith("STEP_DONE"):
             ctx = (
@@ -509,7 +503,17 @@ def main():
                             goal_prompted = False
                             print(f"[simple_controller] LLM move_forward: {meters:.2f} m")
                             executor.start_step_forward(meters)
+                    elif action == "crouch":
+                        goal_active = True
+                        goal_prompted = False
+                        print("[simple_controller] LLM crouch command received.")
+                        executor.start_crouch()
 
+                    elif action == "pick_object":
+                        goal_active = True
+                        goal_prompted = False
+                        print("[simple_controller] LLM pick_object command received.")
+                        executor.start_pick()
                     elif action == "turn_degrees":
                         if nav_goal and not search_mode[0]:
                             print(

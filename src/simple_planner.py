@@ -52,6 +52,8 @@ ALLOWED ACTIONS (exact "action" string):
   (typical 0.6–0.75) so the robot covers ground quickly; the runtime may bump small values to a minimum stride.
   One straight segment per response. After locate_object for nav goals.
 - "turn_degrees": Field "degrees" (required number). POSITIVE = turn left, NEGATIVE = turn right.
+- "crouch": Use ONLY when you have received "SUPER_CLOSE:" in the context and need to lower your center of gravity or inspect something low.
+- "pick_object": Use ONLY when you have received "SUPER_CLOSE:" in the context and the user asked you to grab, lift, or pick something up.
 - "move_to_object": Field "aliases" (required). Vision + **RangeFinder depth** guided walk. Use ONLY after
   "OBJECT_IN_VIEW:" and/or "FOUND:" in CURRENT CONTEXT. The robot aims to get within about **0.21 m** of the target when depth distance_m is reliable and the target is roughly centered (**SUPER_CLOSE:**). **Head pitch is
   not an LLM action** — during approach the controller tilts the head **only** from the target's **vertical position in
@@ -61,8 +63,7 @@ ALLOWED ACTIONS (exact "action" string):
   for dodge) to avoid obstacles — **one** JSON action per response. After a dodge step finishes (**STEP_DONE** /
   **APPROACH_INTERRUPT**), return **move_to_object** with the **same aliases** again to resume the approach. The
   controller auto-completes the goal on SUPER_CLOSE (no separate "done" needed for that path).
-- "done": Task succeeded when the goal does not end with an automatic SUPER_CLOSE (e.g. non-approach goals), or
-  if you judge success from the image before SUPER_CLOSE fires.
+- "done": Task succeeded. Use this ONLY when the ENTIRE user goal is complete (e.g., after navigating AND performing the requested physical action like crouching/picking). Do NOT use this just because you arrived at the object.
 - "fail": ONLY when absolutely impossible. Prefer locate_object + different moves first.
 - "clarify": Field "question" (required string) if you truly need user input.
 

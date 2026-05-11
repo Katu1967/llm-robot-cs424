@@ -41,7 +41,7 @@ class SimpleExecutor:
     FINAL_CREEP_TIMEOUT_S = float(os.getenv("SIMPLE_FINAL_CREEP_TIMEOUT_S", "7.0"))
     FORCE_SUPER_CLOSE_HF = float(os.getenv("SIMPLE_FORCE_SUPER_CLOSE_HF", "0.56"))
     # ~2 feet (0.6096 m) — RangeFinder depth at bbox when roughly centered ends approach.
-    STOP_DISTANCE_M = float(os.getenv("SIMPLE_STOP_DISTANCE_M", "0.210"))
+    STOP_DISTANCE_M = float(os.getenv("SIMPLE_STOP_DISTANCE_M", "0.22"))
 
     # Lower alpha / gain = smoother pitch; bbox cy jitters less on the motors.
     _follow_look_alpha = float(os.getenv("NAO_FOLLOW_LOOK_ALPHA", "0.14"))
@@ -242,6 +242,14 @@ class SimpleExecutor:
             cy_deadband=self._head_cy_deadband,
         )
 
+    def start_crouch(self) -> None:
+        self._mode = "CROUCH"
+        self._prim_elapsed = 0.0
+
+    def start_pick(self) -> None:
+        self._mode = "PICK"
+        self._prim_elapsed = 0.0
+
     def _remember_follow_target(self, obj: dict) -> None:
         cx, cy = obj.get("cx_norm"), obj.get("cy_norm")
         pos = obj.get("position", "center")
@@ -285,8 +293,109 @@ class SimpleExecutor:
         if self._last_poll >= self.POLL_INTERVAL_S:
             self._last_poll = 0.0
             self._update(dt)
+    def _update_crouch(self) -> None:
+        self._prim_elapsed += self.POLL_INTERVAL_S
+        t = self._prim_elapsed
+
+        # Write crouch targets on the very first tick; motors slew continuously.
+        if t <= self.POLL_INTERVAL_S * 2:
+            self._robot.set_joint("LHipPitch",   -0.70)
+            self._robot.set_joint("RHipPitch",   -0.70)
+            self._robot.set_joint("LKneePitch",   1.30)
+            self._robot.set_joint("RKneePitch",   1.30)
+            self._robot.set_joint("LAnklePitch", -0.55)
+            self._robot.set_joint("RAnklePitch", -0.55)
+
+        # Allow 1.8 s for the joints to reach their targets, then report done.
+        # The robot stays crouched — the LLM can follow up with pick_object or
+        # instruct it to stand back up.
+        if t >= 1.8:
+            self.stop()
+            self._on_status("ACTION_DONE: Crouch complete. What next?", None)
+
+    def _update_pick(self) -> None:
+        self._prim_elapsed += self.POLL_INTERVAL_S
+        t = self._prim_elapsed
+
+        # ── Phase 1 (0.0 – 0.8 s): Look down + open hands ─────────────────────
+        # Set once at the start of each phase window; Webots motors slew
+        # continuously so we only need to write the target once per phase.
+        if t <= 0.8:
+            if t <= self.POLL_INTERVAL_S * 2:           # write target on first tick
+                self._robot.set_head_pitch(0.5)
+                self._robot.set_joint("LHand", 1.0)     # 1.0 = fully open
+                self._robot.set_joint("RHand", 1.0)
+
+        # ── Phase 2 (0.8 – 2.0 s): Crouch + reach arms forward-and-down ───────
+        # NAO ShoulderPitch convention:
+        #   +π/2  ≈ arms straight down  (REST_POSE uses +1.4)
+        #   +π    ≈ arms pointing behind the robot
+        #   ~0    ≈ arms horizontal forward
+        #  −value ≈ arms above horizontal (pointing up) — NOT what we want here
+        # To reach a floor-level object ~0.21 m in front of the robot, we need
+        # ShoulderPitch ≈ +1.8–2.0 (arms angled well below horizontal).
+        elif 0.8 < t <= 2.0:
+            if 0.8 < t <= 0.8 + self.POLL_INTERVAL_S * 2:
+                # Bend legs to lower the torso
+                self._robot.set_joint("LHipPitch",    -0.70)
+                self._robot.set_joint("RHipPitch",    -0.70)
+                self._robot.set_joint("LKneePitch",    1.30)
+                self._robot.set_joint("RKneePitch",    1.30)
+                self._robot.set_joint("LAnklePitch",  -0.55)
+                self._robot.set_joint("RAnklePitch",  -0.55)
+
+                # Reach arms forward and DOWN (positive pitch ≈ arms lower)
+                self._robot.set_joint("LShoulderPitch",  1.80)
+                self._robot.set_joint("RShoulderPitch",  1.80)
+                # Narrow the arms slightly inward so both hands reach the same spot
+                self._robot.set_joint("LShoulderRoll",   0.15)
+                self._robot.set_joint("RShoulderRoll",  -0.15)
+                # Keep elbows roughly straight so arms reach far
+                self._robot.set_joint("LElbowYaw",      -1.50)
+                self._robot.set_joint("RElbowYaw",       1.50)
+                self._robot.set_joint("LElbowRoll",     -0.10)
+                self._robot.set_joint("RElbowRoll",      0.10)
+
+        # ── Phase 3 (2.0 – 2.6 s): Close hands to grip ─────────────────────────
+        elif 2.0 < t <= 2.6:
+            if 2.0 < t <= 2.0 + self.POLL_INTERVAL_S * 2:
+                self._robot.set_joint("LHand", 0.0)     # 0.0 = fully closed
+                self._robot.set_joint("RHand", 0.0)
+
+        # ── Phase 4 (2.6 – 4.0 s): Stand back up, arms in carry position ───────
+        elif 2.6 < t <= 4.0:
+            if 2.6 < t <= 2.6 + self.POLL_INTERVAL_S * 2:
+                # Return legs to rest pose
+                self._robot.set_joint("LHipPitch",   -0.45)
+                self._robot.set_joint("RHipPitch",   -0.45)
+                self._robot.set_joint("LKneePitch",   0.87)
+                self._robot.set_joint("RKneePitch",   0.87)
+                self._robot.set_joint("LAnklePitch", -0.41)
+                self._robot.set_joint("RAnklePitch", -0.41)
+
+                # Carry position: arms in front at roughly hip height
+                self._robot.set_joint("LShoulderPitch",  1.20)
+                self._robot.set_joint("RShoulderPitch",  1.20)
+                self._robot.set_joint("LShoulderRoll",   0.20)
+                self._robot.set_joint("RShoulderRoll",  -0.20)
+                self._robot.set_joint("LElbowYaw",      -1.50)
+                self._robot.set_joint("RElbowYaw",       1.50)
+                self._robot.set_joint("LElbowRoll",     -0.80)
+                self._robot.set_joint("RElbowRoll",      0.80)
+                self._robot.set_head_pitch(0.0)
+
+        # ── Done: allow 4.5 s total for the animation to settle ────────────────
+        if t >= 4.5:
+            self.stop()
+            self._on_status("ACTION_DONE: Pick object complete. What next?", None)
 
     def _update(self, dt: float):
+        if self._mode == "CROUCH":
+            self._update_crouch()
+            return
+        if self._mode == "PICK":
+            self._update_pick()
+            return
         if self._mode == "STEP_FWD":
             self._update_step_forward()
             return

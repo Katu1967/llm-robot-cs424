@@ -6,6 +6,7 @@ import time
 import hashlib
 import json
 import logging
+import os
 from enum import Enum, auto
 from typing import Generator, Optional
 
@@ -302,6 +303,10 @@ class PlanExecutor:
         label           = params.get("label", "")
         timeout_s       = float(params.get("timeout_s", 30.0))
         stop_distance_m = float(params.get("stop_distance_m", 0.45))
+        # Enforce a sensible minimum stop distance (can be overridden via env)
+        min_stop = float(os.getenv("MIN_STOP_DISTANCE_M", "0.45"))
+        if stop_distance_m < min_stop:
+            stop_distance_m = min_stop
         deadline        = time.time() + timeout_s
 
         print(
@@ -324,6 +329,16 @@ class PlanExecutor:
             # Object visible
             # ----------------------------------------------------------
             if obj is not None:
+                # Debug: show raw detection fields occasionally to verify depth/bbox
+                if tick % 10 == 0:
+                    try:
+                        print(
+                            f"[move_toward DEBUG] obj keys={list(obj.keys())} "
+                            f"distance_m={obj.get('distance_m')} h_norm={obj.get('h_norm')} "
+                            f"cx={obj.get('cx_norm')} cy={obj.get('cy_norm')} conf={obj.get('confidence')}"
+                        )
+                    except Exception:
+                        pass
                 last_seen_cx = obj["cx_norm"]
                 last_seen_cy = obj["cy_norm"]
                 lost_count   = 0
