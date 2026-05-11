@@ -1,16 +1,26 @@
 """
-Shared YOLO/scene matching for navigation goals (aliases ↔ scene.objects).
+Shared YOLO/scene matching helpers for navigation goals.
 
-Used by the controller during SEARCH_MODE and by SimpleExecutor during approach.
+These functions connect planner aliases, such as "bottle" or "red cup",
+to detected YOLO objects stored in scene_state["objects"].
+
+Used by:
+- controller during SEARCH_MODE
+- SimpleExecutor during object approach
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple, List
+from typing import Optional, Tuple, List
 
 
 def normalize_aliases(aliases: List[str]) -> List[str]:
-    return [a.lower().strip() for a in aliases if a and str(a).strip()]
+    """Lowercase aliases and remove empty values."""
+    return [
+        alias.lower().strip()
+        for alias in aliases
+        if alias and str(alias).strip()
+    ]
 
 
 def match_target_in_scene(
@@ -19,80 +29,138 @@ def match_target_in_scene(
     locked_label: Optional[str] = None,
 ) -> Optional[Tuple[str, dict]]:
     """
-    Return (label, object_dict) if any scene object matches ``aliases``.
-    If ``locked_label`` is set, only that YOLO label is considered (approach lock).
+    Find a scene object whose YOLO label matches one of the target aliases.
+
+    If locked_label is provided, only objects with that exact YOLO label are
+    considered. This is used during approach so the robot stays locked onto
+    the same type of object it originally found.
+
+    Returns:
+        (matched_label, object_dict) if a match is found, otherwise None.
     """
     if not scene_state or not isinstance(scene_state, dict):
         return None
-    als = normalize_aliases(aliases)
-    if not als:
-        return None
-    lock = (locked_label or "").lower().strip() or None
 
-    for obj in scene_state.get("objects", []):
-        lbl = (obj.get("label") or "").lower()
-        if lock and lbl != lock:
+    normalized_aliases = normalize_aliases(aliases)
+    if not normalized_aliases:
+        return None
+
+    locked_label_normalized = (locked_label or "").lower().strip() or None
+
+    for detected_object in scene_state.get("objects", []):
+        detected_label = (detected_object.get("label") or "").lower()
+
+        if locked_label_normalized and detected_label != locked_label_normalized:
             continue
-        for alias in als:
-            if alias in lbl or lbl in alias:
-                return lbl, obj
+
+        for alias in normalized_aliases:
+            if alias in detected_label or detected_label in alias:
+                return detected_label, detected_object
+
     return None
 
 
-def format_object_in_view_line(label: str, obj: dict) -> str:
-    hf = obj.get("height_frac")
-    cx = obj.get("cx_norm")
-    cy = obj.get("cy_norm")
-    parts = [
+def format_object_in_view_line(label: str, detected_object: dict) -> str:
+    """
+    Format a detailed OBJECT_IN_VIEW message for the planner.
+
+    This message tells the LLM that the target object is currently visible,
+    along with image position and estimated distance information.
+    """
+    height_fraction = detected_object.get("height_frac")
+    center_x = detected_object.get("cx_norm")
+    center_y = detected_object.get("cy_norm")
+
+    message_parts = [
         f"OBJECT_IN_VIEW: YOLO sees target '{label}'",
-        f"position={obj.get('position', '?')}",
-        f"distance={obj.get('distance', '?')}",
+        f"position={detected_object.get('position', '?')}",
+        f"distance={detected_object.get('distance', '?')}",
     ]
-    dm = obj.get("distance_m")
+
+    raw_distance_meters = detected_object.get("distance_m")
+
     try:
-        dmv = float(dm) if dm is not None else None
+        distance_meters = (
+            float(raw_distance_meters)
+            if raw_distance_meters is not None
+            else None
+        )
     except (TypeError, ValueError):
-        dmv = None
-    if dmv is not None:
-        parts.append(f"distance_m={dmv:.3f} (RangeFinder depth at bbox, meters)")
+        distance_meters = None
+
+    if distance_meters is not None:
+        message_parts.append(
+            f"distance_m={distance_meters:.3f} "
+            "(RangeFinder depth at bbox, meters)"
+        )
     else:
-        parts.append("distance_m=n/a (RangeFinder not available for this box)")
-    if hf is not None:
-        parts.append(f"height_frac={hf}")
-    if cx is not None and cy is not None:
-        parts.append(f"cx_norm={cx} cy_norm={cy} (vs image center 0.5)")
-    return " | ".join(parts)
+        message_parts.append(
+            "distance_m=n/a "
+            "(RangeFinder not available for this box)"
+        )
+
+    if height_fraction is not None:
+        message_parts.append(f"height_frac={height_fraction}")
+
+    if center_x is not None and center_y is not None:
+        message_parts.append(
+            f"cx_norm={center_x} cy_norm={center_y} "
+            "(vs image center 0.5)"
+        )
+
+    return " | ".join(message_parts)
 
 
 def format_feedback_line(scene_state: Optional[dict], aliases: List[str]) -> str:
-    """Short line for primitive STEP_DONE: target vs center / visibility."""
-    m = match_target_in_scene(scene_state, aliases)
-    if not m:
+    """
+    Format a short target visibility message after a primitive action finishes.
+
+    This is mainly used after STEP_DONE so the planner knows whether the target
+    is visible, centered, left, right, or missing from the current camera view.
+    """
+    match = match_target_in_scene(scene_state, aliases)
+
+    if not match:
         return (
             "FEEDBACK: target not in current VISIBLE OBJECTS list "
             "(may be occluded, motion blur, or wrong angle)."
         )
-    lbl, obj = m
-    cx = obj.get("cx_norm")
-    cy = obj.get("cy_norm")
-    pos = obj.get("position", "?")
-    rel = "centered"
-    if pos == "left":
-        rel = "left of image center — consider turning left or look_left yaw"
-    elif pos == "right":
-        rel = "right of image center — consider turning right"
-    hf = obj.get("height_frac", "?")
-    dm = obj.get("distance_m")
+
+    matched_label, detected_object = match
+
+    center_x = detected_object.get("cx_norm")
+    center_y = detected_object.get("cy_norm")
+    position = detected_object.get("position", "?")
+    height_fraction = detected_object.get("height_frac", "?")
+
+    position_guidance = "centered"
+
+    if position == "left":
+        position_guidance = "left of image center — consider turning left"
+    elif position == "right":
+        position_guidance = "right of image center — consider turning right"
+
+    raw_distance_meters = detected_object.get("distance_m")
+
     try:
-        dmv = float(dm) if dm is not None else None
+        distance_meters = (
+            float(raw_distance_meters)
+            if raw_distance_meters is not None
+            else None
+        )
     except (TypeError, ValueError):
-        dmv = None
-    dm_bit = (
-        f", distance_m={dmv:.3f}m (RangeFinder)"
-        if dmv is not None
+        distance_meters = None
+
+    distance_message = (
+        f", distance_m={distance_meters:.3f}m (RangeFinder)"
+        if distance_meters is not None
         else ", distance_m=n/a"
     )
+
     return (
-        f"FEEDBACK: target '{lbl}' visible — position={pos} ({rel}), "
-        f"height_frac={hf}, cx_norm={cx}, cy_norm={cy}{dm_bit}"
+        f"FEEDBACK: target '{matched_label}' visible — "
+        f"position={position} ({position_guidance}), "
+        f"height_frac={height_fraction}, "
+        f"cx_norm={center_x}, cy_norm={center_y}"
+        f"{distance_message}"
     )

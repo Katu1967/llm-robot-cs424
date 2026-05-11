@@ -1,43 +1,37 @@
 """
 simple_planner.py — LLM planner for the simple controller stack.
 
-The LLM chooses actions: locate_object (spin search + SEARCH_MODE), move_forward,
-turn_degrees, move_to_object, done, fail, clarify. **Head pitch is not an LLM tool** — during approach the controller
-adjusts pitch only from the target's vertical position in the image (above/below center); yaw stays neutral.
+The planner chooses high-level robot actions. Head pitch is not exposed as an LLM
+tool: during visual approach, the controller adjusts pitch from the target's
+vertical image position while keeping yaw neutral.
 
-During **locate_object** spin and **SEARCH_MODE** before FOUND, the runtime keeps the head **neutral** so YOLO scans
-at a normal horizon.
-
-During ``move_to_object``, the executor may emit **APPROACH_CHECKPOINT** (~10 s): feet pause (no Stand); head pitch
-still tracks the target vertically; the LLM should continue with the same ``move_to_object`` aliases or issue a short dodge.
-
-After ``locate_object`` the executor spins ~360° while the controller still polls
-YOLO and may inject ``OBJECT_IN_VIEW`` into context before the spin finishes.
+Search behavior:
+- locate_object performs a 360° spin with the head neutral.
+- SEARCH_MODE before FOUND keeps the head neutral so YOLO scans the horizon.
+- move_to_object uses vision plus RangeFinder depth to approach the target.
+- APPROACH_CHECKPOINT pauses the feet briefly so the planner can continue or dodge.
 """
 
+import base64
+import json
 import os
 import re
-import json
-import base64
 import threading
 from io import BytesIO
 from typing import List, Optional
 
 try:
     from PIL import Image
-    _PIL_AVAILABLE = True
+    PIL_AVAILABLE = True
 except ImportError:
-    _PIL_AVAILABLE = False
+    PIL_AVAILABLE = False
 
 try:
-    import ollama as _ollama
-    _OLLAMA_AVAILABLE = True
+    import ollama as ollama_api
+    OLLAMA_AVAILABLE = True
 except ImportError:
-    _OLLAMA_AVAILABLE = False
+    OLLAMA_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """You are the planning brain of a NAO humanoid robot in Webots.
 You MUST pass valid tool parameters in every JSON response (see PASSING PARAMETERS below).
@@ -112,152 +106,144 @@ JSON EXAMPLES:
 
 _GOAL_STOPWORDS = frozenset(
     {
-        "the",
-        "a",
-        "an",
-        "to",
-        "go",
-        "get",
-        "and",
-        "for",
-        "nao",
-        "robot",
-        "walk",
-        "move",
-        "head",
-        "toward",
-        "towards",
-        "near",
-        "find",
-        "locate",
-        "approach",
-        "please",
-        "me",
-        "from",
-        "with",
-        "that",
-        "this",
-        "your",
-        "its",
-        "our",
-        "use",
-        "then",
-        "when",
-        "how",
-        "can",
-        "you",
-        "let",
-        "make",
-        "just",
+        "the", "a", "an", "to", "go", "get", "and", "for", "nao", "robot",
+        "walk", "move", "head", "toward", "towards", "near", "find", "locate",
+        "approach", "please", "me", "from", "with", "that", "this", "your",
+        "its", "our", "use", "then", "when", "how", "can", "you", "let",
+        "make", "just",
     }
 )
 
 
+_LOW_OBJECT_KEYWORDS = (
+    "laptop", "computer", "keyboard", "floor", "ground", "low", "desk",
+    "table", "bag", "backpack", "phone", "book",
+)
+
+
 def _label_matches_user_goal(goal: str, label: str) -> bool:
-    lc = (label or "").strip().lower()
-    g = (goal or "").lower()
-    if not lc or not g:
+    """Return True when a detected label plausibly refers to the user's target."""
+    normalized_label = (label or "").strip().lower()
+    normalized_goal = (goal or "").lower()
+
+    if not normalized_label or not normalized_goal:
         return False
-    if lc in g:
+
+    if normalized_label in normalized_goal:
         return True
-    for w in g.replace(",", " ").replace(".", " ").split():
-        w = w.strip("?!'\"")
-        if len(w) < 3 or w in _GOAL_STOPWORDS:
+
+    goal_words = normalized_goal.replace(",", " ").replace(".", " ").split()
+    for word in goal_words:
+        cleaned_word = word.strip("?!'\"")
+        if len(cleaned_word) < 3 or cleaned_word in _GOAL_STOPWORDS:
             continue
-        if w == lc or w in lc or lc in w:
+        if (
+            cleaned_word == normalized_label
+            or cleaned_word in normalized_label
+            or normalized_label in cleaned_word
+        ):
             return True
+
     return False
 
 
-def _target_distance_summary(goal: str, objs: List[dict]) -> str:
-    """Repeat RangeFinder depth for detections that plausibly match the user goal (e.g. dog)."""
-    lines: List[str] = []
-    for o in objs:
-        lb = o.get("label")
-        if not lb or not _label_matches_user_goal(goal, str(lb)):
+def _safe_float(value) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _target_distance_summary(goal: str, detected_objects: List[dict]) -> str:
+    """Summarize RangeFinder depth for detections related to the current goal."""
+    summary_lines: List[str] = []
+
+    for detected_object in detected_objects:
+        label = detected_object.get("label")
+        if not label or not _label_matches_user_goal(goal, str(label)):
             continue
-        dm = o.get("distance_m")
-        try:
-            dmv = float(dm) if dm is not None else None
-        except (TypeError, ValueError):
-            dmv = None
-        pos = o.get("position", "?")
-        if dmv is not None:
-            lines.append(
-                f"  - {lb}: distance_m={dmv:.3f} m (RangeFinder @ YOLO bbox), position={pos}"
+
+        depth_meters = _safe_float(detected_object.get("distance_m"))
+        position = detected_object.get("position", "?")
+
+        if depth_meters is None:
+            summary_lines.append(
+                f"  - {label}: distance_m=n/a (no RangeFinder sample for this box), position={position}"
             )
         else:
-            lines.append(
-                f"  - {lb}: distance_m=n/a (no RangeFinder sample for this box), position={pos}"
+            summary_lines.append(
+                f"  - {label}: distance_m={depth_meters:.3f} m "
+                f"(RangeFinder @ YOLO bbox), position={position}"
             )
-    if not lines:
+
+    if not summary_lines:
         return ""
+
     return (
         "TARGET DEPTH (goal-relevant rows — use **distance_m** in meters for range, not the `distance` bucket):\n"
-        + "\n".join(lines)
+        + "\n".join(summary_lines)
         + "\n"
     )
 
 
-def build_planner_user_text(goal: str, scene_state: dict, context: str) -> str:
-    """Shared user message for planner LLMs (Ollama, Gemini, etc.)."""
-    objs = scene_state.get("objects", [])
+def _format_visible_objects(detected_objects: List[dict]) -> str:
+    object_lines: List[str] = []
 
-    obj_list = []
-    for o in objs:
-        hf = o.get("height_frac")
-        hf_s = f", height_frac={hf}" if hf is not None else ""
-        cx = o.get("cx_norm")
-        cy = o.get("cy_norm")
-        xy_s = ""
-        if cx is not None and cy is not None:
-            xy_s = f", cx_norm={cx}, cy_norm={cy}"
-        dm = o.get("distance_m")
-        try:
-            dmv = float(dm) if dm is not None else None
-        except (TypeError, ValueError):
-            dmv = None
-        dm_s = f", distance_m={dmv:.3f}" if dmv is not None else ", distance_m=n/a"
-        obj_list.append(
-            f"- {o['label']}: position={o['position']}, distance={o['distance']}{dm_s}{hf_s}{xy_s}"
+    for detected_object in detected_objects:
+        height_fraction = detected_object.get("height_frac")
+        height_text = f", height_frac={height_fraction}" if height_fraction is not None else ""
+
+        center_x = detected_object.get("cx_norm")
+        center_y = detected_object.get("cy_norm")
+        center_text = ""
+        if center_x is not None and center_y is not None:
+            center_text = f", cx_norm={center_x}, cy_norm={center_y}"
+
+        depth_meters = _safe_float(detected_object.get("distance_m"))
+        depth_text = f", distance_m={depth_meters:.3f}" if depth_meters is not None else ", distance_m=n/a"
+
+        object_lines.append(
+            f"- {detected_object['label']}: position={detected_object['position']}, "
+            f"distance={detected_object['distance']}{depth_text}{height_text}{center_text}"
         )
 
-    objs_str = "\n".join(obj_list) if obj_list else "(None)"
-    target_depth = _target_distance_summary(goal, objs)
+    return "\n".join(object_lines) if object_lines else "(None)"
 
-    gl = goal.lower()
-    floor_scan_reminder = ""
-    if any(
-        k in gl
-        for k in (
-            "laptop",
-            "computer",
-            "keyboard",
-            "floor",
-            "ground",
-            "low",
-            "desk",
-            "table",
-            "bag",
-            "backpack",
-            "phone",
-            "book",
-        )
-    ):
-        floor_scan_reminder = (
+
+def _low_object_note(goal: str, detected_objects: List[dict], context: str) -> str:
+    note = ""
+    normalized_goal = goal.lower()
+
+    if any(keyword in normalized_goal for keyword in _LOW_OBJECT_KEYWORDS):
+        note = (
             "\nLOW-OBJECT NOTE: The goal may involve something low. The head stays **level** during search; "
             "after the target is visible, **move_to_object** handles approach while head pitch tracks the bbox vertically — "
             "you cannot command look_down.\n"
         )
 
-    cu = (context or "").upper()
-    if not obj_list and ("TIMEOUT" in cu or "LOST" in cu):
-        floor_scan_reminder += (
+    normalized_context = (context or "").upper()
+    search_failed = "TIMEOUT" in normalized_context or "LOST" in normalized_context
+
+    if not detected_objects and search_failed:
+        note += (
             "\nNO TARGET IN VISIBLE OBJECTS after search trouble — prefer **locate_object**, **move_forward**, or "
             "**turn_degrees** (head stays neutral).\n"
         )
 
-    rf_legend = (
+    return note
+
+
+def build_planner_user_text(goal: str, scene_state: dict, context: str) -> str:
+    detected_objects = scene_state.get("objects", [])
+    visible_objects_text = _format_visible_objects(detected_objects)
+    target_depth_text = _target_distance_summary(goal, detected_objects)
+    low_object_text = _low_object_note(goal, detected_objects, context)
+
+    sonar_state = scene_state.get("sonar", {})
+    left_sonar_m = sonar_state.get("left_m")
+    right_sonar_m = sonar_state.get("right_m")
+
+    range_finder_legend = (
         "RANGE_FINDER: **distance_m** is true depth in **meters** from the Webots RangeFinder sampled at the "
         "YOLO bbox (same geometry as the RGB frame for alignment). It is **not** inferred from RGB appearance. "
         "The **distance** field on each line is a coarse **2D box size bucket**, not meters.\n\n"
@@ -266,11 +252,11 @@ def build_planner_user_text(goal: str, scene_state: dict, context: str) -> str:
     return f"""USER GOAL: {goal}
 CURRENT CONTEXT: {context or "Initial planning — no executor status yet"}
 
-{rf_legend}{target_depth}VISIBLE OBJECTS:
-{objs_str}
+{range_finder_legend}{target_depth_text}VISIBLE OBJECTS:
+{visible_objects_text}
 
-SONAR: Left={scene_state.get('sonar',{}).get('left_m')}m, Right={scene_state.get('sonar',{}).get('right_m')}m
-{floor_scan_reminder}
+SONAR: Left={left_sonar_m}m, Right={right_sonar_m}m
+{low_object_text}
 If the goal is to go to / find / approach an object, your FIRST response MUST be locate_object with a non-empty "aliases" list.
 That starts a **360° spin** (head **neutral / level**) plus detection; watch for FOUND:, TIMEOUT:, and OBJECT_IN_VIEW: in CURRENT CONTEXT.
 After the spin, explore with **move_forward** and **turn_degrees** (one tool per step). **look_up** and **look_down**
@@ -284,56 +270,54 @@ What is your next action? Respond in JSON only."""
 
 
 class SimplePlanner:
-    """
-    Thin wrapper around Ollama.  Maintains the goal and fires off
-    planning requests in a background thread so it never blocks the
-    Webots step loop.
-    """
+    """Non-blocking wrapper around the selected LLM planner backend."""
 
     def __init__(self):
-        host  = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
-        model = os.getenv("OLLAMA_MODEL", "llama3.2-vision")
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2-vision")
 
         self._backend = os.getenv("SIMPLE_PLANNER_BACKEND", "ollama").strip().lower()
-        self._model  = model
+        self._model = ollama_model
         self._client: Optional[object] = None
-        self._lock   = threading.Lock()
+        self._lock = threading.Lock()
 
-        self._goal:    Optional[str]  = None
-        self._plan:    Optional[dict] = None   # latest parsed LLM response
+        self._goal: Optional[str] = None
+        self._plan: Optional[dict] = None
         self._planning = False
-        self._done     = False
+        self._done = False
 
-        # Human-readable backend + model id for logs (SIMPLE_PLANNER_BACKEND=ollama|gemini)
         if self._backend == "gemini":
             gemini_model = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
             self._backend_label = "Gemini"
             self._active_model = gemini_model
         else:
             self._backend_label = "Ollama"
-            self._active_model = model
+            self._active_model = ollama_model
 
         if self._backend == "gemini":
             print(
                 f"[SimplePlanner] LLM backend: Gemini (Google API) | model={self._active_model}\n"
-                f"[SimplePlanner]   (set SIMPLE_PLANNER_BACKEND=gemini; key: GEMINI_API_KEY or GOOGLE_API_KEY)"
+                "[SimplePlanner]   (set SIMPLE_PLANNER_BACKEND=gemini; key: GEMINI_API_KEY or GOOGLE_API_KEY)"
             )
-        elif _OLLAMA_AVAILABLE:
-            try:
-                client = _ollama.Client(host=host, timeout=300.0)
-                client.list()
-                self._client = client
-                print(
-                    f"[SimplePlanner] LLM backend: Ollama (local) | model={self._active_model} | host={host}\n"
-                    f"[SimplePlanner]   (use SIMPLE_PLANNER_BACKEND=gemini to use Google Gemini instead)"
-                )
-            except Exception as e:
-                print(f"[SimplePlanner] WARNING: Ollama unavailable: {e}")
+        elif OLLAMA_AVAILABLE:
+            self._init_ollama_client(ollama_host)
         else:
             print(
                 "[SimplePlanner] WARNING: Ollama not installed or backend misconfigured.\n"
                 f"[SimplePlanner]   SIMPLE_PLANNER_BACKEND={self._backend!r} | expected pip package: ollama"
             )
+
+    def _init_ollama_client(self, ollama_host: str) -> None:
+        try:
+            client = ollama_api.Client(host=ollama_host, timeout=300.0)
+            client.list()
+            self._client = client
+            print(
+                f"[SimplePlanner] LLM backend: Ollama (local) | model={self._active_model} | host={ollama_host}\n"
+                "[SimplePlanner]   (use SIMPLE_PLANNER_BACKEND=gemini to use Google Gemini instead)"
+            )
+        except Exception as error:
+            print(f"[SimplePlanner] WARNING: Ollama unavailable: {error}")
 
     def set_goal(self, goal: str):
         with self._lock:
@@ -347,16 +331,18 @@ class SimplePlanner:
             return self._goal
 
     def is_planning(self) -> bool:
-        with self._lock: return self._planning
+        with self._lock:
+            return self._planning
 
     def has_plan(self) -> bool:
-        with self._lock: return self._plan is not None
+        with self._lock:
+            return self._plan is not None
 
     def consume_plan(self) -> Optional[dict]:
         with self._lock:
-            p = self._plan
+            current_plan = self._plan
             self._plan = None
-            return p
+            return current_plan
 
     def is_done(self) -> bool:
         with self._lock:
@@ -367,110 +353,118 @@ class SimplePlanner:
             if self._planning or self._goal is None:
                 return
             self._planning = True
+            goal = self._goal
 
-        goal  = self._goal
-        t = threading.Thread(
+        planning_thread = threading.Thread(
             target=self._call_llm,
             args=(goal, scene_state, snapshot_path, context),
             daemon=True,
         )
-        t.start()
+        planning_thread.start()
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
+    def _call_llm(
+        self,
+        goal: str,
+        scene_state: dict,
+        snapshot_path: Optional[str],
+        context: str,
+    ) -> None:
+        extracted_json = None
 
-    def _call_llm(self, goal: str, scene_state: dict,
-                  snapshot_path: Optional[str], context: str) -> None:
-        json_str = None
         try:
             if self._backend == "gemini":
-                from gemini_llm_connector import gemini_plan_from_scene
-
-                print(
-                    f"[SimplePlanner] Calling LLM: Gemini | model={self._active_model}"
-                )
-                plan = gemini_plan_from_scene(
-                    goal,
-                    scene_state,
-                    context=context,
-                    snapshot_path=snapshot_path,
-                )
-                if plan is None:
-                    return
-                with self._lock:
-                    if plan.get("action") == "done":
-                        self._done = True
-                    self._plan = plan
+                self._call_gemini(goal, scene_state, snapshot_path, context)
                 return
 
             user_text = build_planner_user_text(goal, scene_state, context)
-            messages  = self._build_messages(user_text, snapshot_path)
+            messages = self._build_messages(user_text, snapshot_path)
 
             if self._client is None:
                 print("[SimplePlanner] ERROR: Ollama client not available.")
                 return
 
-            print(
-                f"[SimplePlanner] Calling LLM: Ollama (local) | model={self._active_model}"
-            )
-            resp = self._client.chat(model=self._model, messages=messages)
-            raw  = resp["message"]["content"].strip()
+            print(f"[SimplePlanner] Calling LLM: Ollama (local) | model={self._active_model}")
+            response = self._client.chat(model=self._model, messages=messages)
+            raw_response = response["message"]["content"].strip()
 
-            # Always log what we got so problems are visible
-            print(f"[SimplePlanner] Raw response ({len(raw)} chars):\n{raw[:400]}")
+            print(f"[SimplePlanner] Raw response ({len(raw_response)} chars):\n{raw_response[:400]}")
 
-            if not raw:
+            if not raw_response:
                 print("[SimplePlanner] ERROR: LLM returned an empty response.")
                 return
 
-            # --- Robust JSON extraction ---
-            import re
-
-            fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
-            if fence_match:
-                json_str = fence_match.group(1).strip()
-            else:
-                brace_match = re.search(r"\{[\s\S]*\}", raw)
-                if brace_match:
-                    json_str = brace_match.group(0)
-
-            if not json_str:
+            extracted_json = self._extract_json_object(raw_response)
+            if not extracted_json:
                 print("[SimplePlanner] ERROR: No JSON object found in response.")
                 return
 
-            plan = json.loads(json_str)
+            plan = json.loads(extracted_json)
             print(f"[SimplePlanner] Parsed action: '{plan.get('action')}'")
+            self._store_plan(plan)
 
-            with self._lock:
-                if plan.get("action") == "done":
-                    self._done = True
-                self._plan = plan
-
-        except json.JSONDecodeError as e:
-            print(f"[SimplePlanner] JSON parse error: {e}")
-            print(f"[SimplePlanner] Attempted to parse: {json_str!r}")
-        except Exception as e:
-            print(f"[SimplePlanner] LLM error: {e}")
+        except json.JSONDecodeError as error:
+            print(f"[SimplePlanner] JSON parse error: {error}")
+            print(f"[SimplePlanner] Attempted to parse: {extracted_json!r}")
+        except Exception as error:
+            print(f"[SimplePlanner] LLM error: {error}")
         finally:
             with self._lock:
                 self._planning = False
 
-    def _build_messages(self, user_text: str, snapshot_path: Optional[str]) -> list:
-        user_msg: dict = {"role": "user", "content": user_text}
+    def _call_gemini(
+        self,
+        goal: str,
+        scene_state: dict,
+        snapshot_path: Optional[str],
+        context: str,
+    ) -> None:
+        from gemini_llm_connector import gemini_plan_from_scene
 
-        if snapshot_path and os.path.isfile(snapshot_path) and _PIL_AVAILABLE:
+        print(f"[SimplePlanner] Calling LLM: Gemini | model={self._active_model}")
+        plan = gemini_plan_from_scene(
+            goal,
+            scene_state,
+            context=context,
+            snapshot_path=snapshot_path,
+        )
+
+        if plan is not None:
+            self._store_plan(plan)
+
+    def _store_plan(self, plan: dict) -> None:
+        with self._lock:
+            if plan.get("action") == "done":
+                self._done = True
+            self._plan = plan
+
+    @staticmethod
+    def _extract_json_object(raw_response: str) -> Optional[str]:
+        fenced_json = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_response)
+        if fenced_json:
+            return fenced_json.group(1).strip()
+
+        inline_json = re.search(r"\{[\s\S]*\}", raw_response)
+        if inline_json:
+            return inline_json.group(0)
+
+        return None
+
+    def _build_messages(self, user_text: str, snapshot_path: Optional[str]) -> list:
+        user_message: dict = {"role": "user", "content": user_text}
+
+        if snapshot_path and os.path.isfile(snapshot_path) and PIL_AVAILABLE:
             try:
-                with Image.open(snapshot_path) as img:
-                    buf = BytesIO()
-                    img.save(buf, format="JPEG")
-                    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                user_msg["images"] = [img_b64]
+                with Image.open(snapshot_path) as image:
+                    image_buffer = BytesIO()
+                    image.save(image_buffer, format="JPEG")
+                    encoded_image = base64.b64encode(image_buffer.getvalue()).decode("utf-8")
+
+                user_message["images"] = [encoded_image]
                 print(f"[SimplePlanner] Attached image: {os.path.basename(snapshot_path)}")
-            except Exception as e:
-                print(f"[SimplePlanner] Image encode failed: {e}")
+            except Exception as error:
+                print(f"[SimplePlanner] Image encode failed: {error}")
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            user_msg,
+            user_message,
         ]

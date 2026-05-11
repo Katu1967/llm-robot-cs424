@@ -120,16 +120,16 @@ class SceneStateExtractor:
         """Webots RangeFinder device (or ``None``) — same instance used for ``distance_m``."""
         return self._rangefinder
 
-    def _screen_label(self, cx_px: int) -> str:
-        w = self._camera.getWidth()
-        frac = cx_px / w if w > 0 else 0.5
-        if frac < 0.38:
+    def _screen_label(self, center_x_px: int) -> str:
+        camera_width = self._camera.getWidth()
+        horizontal_fraction = center_x_px / camera_width if camera_width > 0 else 0.5
+        if horizontal_fraction < 0.38:
             return "left"
-        if frac > 0.62:
+        if horizontal_fraction > 0.62:
             return "right"
         return "center"
 
-    def _distance_bucket(self, box_h_frac: float, distance_m: Optional[float] = None) -> str:
+    def _distance_bucket(self, box_height_fraction: float, distance_m: Optional[float] = None) -> str:
         if distance_m is not None:
             if distance_m <= 0.40:
                 return "very_near"
@@ -138,92 +138,92 @@ class SceneStateExtractor:
             if distance_m <= 1.75:
                 return "medium"
             return "far"
-        if box_h_frac > 0.40:
+        if box_height_fraction > 0.40:
             return "very_near"
-        if box_h_frac > 0.18:
+        if box_height_fraction > 0.18:
             return "near"
-        if box_h_frac > 0.07:
+        if box_height_fraction > 0.07:
             return "medium"
         return "far"
 
-    def _screen_angle_deg(self, cx_px: int) -> float:
-        w = self._camera.getWidth()
-        fl = w / (2.0 * math.tan(math.radians(NAO_HFOV_DEG / 2.0)))
-        return round(math.degrees(math.atan2(cx_px - w / 2.0, fl)), 1)
+    def _screen_angle_deg(self, center_x_px: int) -> float:
+        camera_width = self._camera.getWidth()
+        focal_length = camera_width / (2.0 * math.tan(math.radians(NAO_HFOV_DEG / 2.0)))
+        return round(math.degrees(math.atan2(center_x_px - camera_width / 2.0, focal_length)), 1)
 
     def _read_sonar(self) -> dict:
-        out = {}
-        for name, dev in self._sonar.items():
-            val = _safe_read(dev, "getValue")
-            key = "left_m" if "Left" in name else "right_m"
-            out[key] = round(val, 2) if val is not None else None
-        return out
+        sonar_readings = {}
+        for sensor_name, sensor_device in self._sonar.items():
+            sensor_value = _safe_read(sensor_device, "getValue")
+            reading_key = "left_m" if "Left" in sensor_name else "right_m"
+            sonar_readings[reading_key] = round(sensor_value, 2) if sensor_value is not None else None
+        return sonar_readings
 
     def _read_gps(self) -> Optional[dict]:
-        v = _safe_read(self._gps, "getValues")
-        if v is None:
+        gps_values = _safe_read(self._gps, "getValues")
+        if gps_values is None:
             return None
-        return {"x_m": round(v[0], 3), "y_m": round(v[1], 3), "z_m": round(v[2], 3)}
+        return {"x_m": round(gps_values[0], 3), "y_m": round(gps_values[1], 3), "z_m": round(gps_values[2], 3)}
 
     def _read_heading(self) -> Optional[float]:
-        v = _safe_read(self._imu, "getRollPitchYaw")
-        if v is None:
+        roll_pitch_yaw = _safe_read(self._imu, "getRollPitchYaw")
+        if roll_pitch_yaw is None:
             return None
-        return round(math.degrees(v[2]), 1)
+        return round(math.degrees(roll_pitch_yaw[2]), 1)
 
-    def _depth_for_box(self, x: int, y: int, w: int, h: int) -> Optional[float]:
+    def _depth_for_box(self, box_x: int, box_y: int, box_w: int, box_h: int) -> Optional[float]:
         if self._rangefinder is None:
             return None
         try:
-            depth = read_range_depth_hw(self._rangefinder)
-            if depth is None:
+            depth_array = read_range_depth_hw(self._rangefinder)
+            if depth_array is None:
                 return None
-            mn = float(self._rangefinder.getMinRange())
-            mx = float(self._rangefinder.getMaxRange())
-            cam_w = self._camera.getWidth()
-            cam_h = self._camera.getHeight()
+            min_range = float(self._rangefinder.getMinRange())
+            max_range = float(self._rangefinder.getMaxRange())
+            camera_width = self._camera.getWidth()
+            camera_height = self._camera.getHeight()
             return median_depth_in_camera_box(
-                depth, cam_w, cam_h, x, y, w, h, min_m=mn + 1e-4, max_m=mx - 1e-3
+                depth_array, camera_width, camera_height, box_x, box_y, box_w, box_h, min_m=min_range + 1e-4, max_m=max_range - 1e-3
             )
         except Exception as exc:
             print(f"[SceneState] RangeFinder depth error: {exc}")
             return None
 
     def _build_objects(self, detections: list) -> list:
-        cam_w = self._camera.getWidth()
-        cam_h = self._camera.getHeight()
+        camera_width = self._camera.getWidth()
+        camera_height = self._camera.getHeight()
         result = []
-        for det in detections:
-            x, y, w, h = det["box"]
-            cx = x + w // 2
-            cy = y + h // 2
-            h_frac = h / cam_h if cam_h > 0 else 0.0
-            w_frac = w / cam_w if cam_w > 0 else 0.0
-            cx_norm = cx / cam_w if cam_w > 0 else 0.5
-            cy_norm = cy / cam_h if cam_h > 0 else 0.5
-            depth_m = self._depth_for_box(x, y, w, h)
-            bucket = self._distance_bucket(h_frac, depth_m)
+        for detection in detections:
+            box_x, box_y, box_w, box_h = detection["box"]
+            center_x = box_x + box_w // 2
+            center_y = box_y + box_h // 2
+            height_fraction = box_h / camera_height if camera_height > 0 else 0.0
+            width_fraction = box_w / camera_width if camera_width > 0 else 0.0
+            center_x_normalized = center_x / camera_width if camera_width > 0 else 0.5
+            center_y_normalized = center_y / camera_height if camera_height > 0 else 0.5
+            depth_m = self._depth_for_box(box_x, box_y, box_w, box_h)
+            distance_bucket = self._distance_bucket(height_fraction, depth_m)
             obj = {
-                "label": det["label"],
-                "confidence": round(float(det.get("confidence", 0.0)), 3),
-                "position": self._screen_label(cx),
-                "distance": bucket,
-                "height_frac": round(h_frac, 3),
-                "width_frac": round(w_frac, 3),
-                "cx_norm": round(max(0.0, min(1.0, cx_norm)), 3),
-                "cy_norm": round(max(0.0, min(1.0, cy_norm)), 3),
+                "label": detection["label"],
+                "confidence": round(float(detection.get("confidence", 0.0)), 3),
+                "position": self._screen_label(center_x),
+                "distance": distance_bucket,
+                "height_frac": round(height_fraction, 3),
+                "width_frac": round(width_fraction, 3),
+                "cx_norm": round(max(0.0, min(1.0, center_x_normalized)), 3),
+                "cy_norm": round(max(0.0, min(1.0, center_y_normalized)), 3),
                 "distance_m": depth_m,
                 "depth_distance_m": depth_m,
                 "estimated_distance_m": depth_m,
-                "bounding_box": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
-                "center_px": {"x": int(cx), "y": int(cy)},
-                "screen_position": {"x_norm": round(max(0.0, min(1.0, cx_norm)), 3), "y_norm": round(max(0.0, min(1.0, cy_norm)), 3)},
-                "horizontal_angle_deg": self._screen_angle_deg(cx),
-                "relative_distance": bucket,
-                "centred_in_frame": abs(cx - cam_w / 2) < cam_w * 0.15,
+                "bounding_box": {"x": int(box_x), "y": int(box_y), "width": int(box_w), "height": int(box_h)},
+                "center_px": {"x": int(center_x), "y": int(center_y)},
+                "screen_position": {"x_norm": round(max(0.0, min(1.0, center_x_normalized)), 3), "y_norm": round(max(0.0, min(1.0, center_y_normalized)), 3)},
+                "horizontal_angle_deg": self._screen_angle_deg(center_x),
+                "relative_distance": distance_bucket,
+                "centred_in_frame": abs(center_x - camera_width / 2) < camera_width * 0.15,
             }
             result.append(obj)
-        result.sort(key=lambda o: (o["distance_m"] if o["distance_m"] is not None else 999.0, -o["height_frac"]))
+        result.sort(key=lambda obj_item: (obj_item["distance_m"] if obj_item["distance_m"] is not None else 999.0, -obj_item["height_frac"]))
         return result
 
     def _save_snapshot(self, bgr_frame: np.ndarray, sim_time_ms: int) -> str:

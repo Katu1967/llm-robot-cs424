@@ -1,12 +1,11 @@
 """
-YOLOv8 object detection module.
+YOLOv8 object detection helper.
 
-Provides a reusable YOLODetector class that can be imported by other scripts
-(e.g. nao_cam.py) to run detection on individual frames from any image source.
-Uses the Ultralytics YOLOv8 implementation.
+This module provides YOLODetector, a small wrapper around Ultralytics YOLOv8
+for running object detection on single image frames.
 
-Model files required (place in src/models/):
-  - yolov8n.pt (or other YOLOv8 .pt files)
+Expected model location:
+    src/models/yolov8n.pt
 """
 
 import os
@@ -14,25 +13,22 @@ import cv2 as cv
 import numpy as np
 from ultralytics import YOLO
 
-# ---------------------------------------------------------------------------
-# Default paths (relative to this file so they work regardless of CWD)
-# ---------------------------------------------------------------------------
-_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_MODELS_DIR = os.path.join(_SRC_DIR, "models")
+
+src_dir = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODELS_DIR = os.path.join(src_dir, "models")
 
 
 class YOLODetector:
     """
-    Wraps YOLOv8 (via Ultralytics) for single-frame object detection.
+    Runs YOLOv8 detection on individual BGR frames.
 
-    Parameters
-    ----------
-    models_dir : str
-        Directory containing the .pt model file.
-    model_name : str
-        Name of the model file (default: yolov8n.pt).
-    confidence_threshold : float
-        Minimum detection confidence to keep (0–1).
+    Args:
+        models_dir:
+            Directory containing the YOLO .pt model file.
+        model_name:
+            Name of the model file to load.
+        confidence_threshold:
+            Minimum confidence required to keep a detection.
     """
 
     def __init__(
@@ -40,7 +36,7 @@ class YOLODetector:
         models_dir: str = DEFAULT_MODELS_DIR,
         model_name: str = "yolov8n.pt",
         confidence_threshold: float = 0.5,
-        **kwargs,  # Accept extra args for backward compatibility
+        **kwargs,
     ):
         model_path = os.path.join(models_dir, model_name)
 
@@ -50,92 +46,109 @@ class YOLODetector:
                 "Run 'make models' to download it."
             )
 
-        # Load the YOLOv8 model
         self.model = YOLO(model_path)
-        self.classes = self.model.names  # dict of {id: name}
-        self.conf_thresh = confidence_threshold
+        self.class_names = self.model.names
+        self.confidence_threshold = confidence_threshold
 
-        # Assign a fixed colour per class for consistent visualisation
         np.random.seed(42)
-        self.colors = np.random.randint(
-            0, 255, size=(len(self.classes), 3), dtype="uint8"
+        self.class_colors = np.random.randint(
+            0,
+            255,
+            size=(len(self.class_names), 3),
+            dtype="uint8",
         )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def detect(self, bgr_frame: np.ndarray) -> list[dict]:
         """
-        Run YOLOv8 detection on a single BGR frame.
+        Detect objects in one BGR frame.
 
-        Returns
-        -------
-        list[dict]
-            Each dict has keys:
-              'label'      : str   – class name
-              'confidence' : float – detection confidence
-              'box'        : (x, y, w, h) in pixel coords
-              'class_id'   : int
+        Returns a list of dictionaries with:
+            label:
+                Detected class name.
+            confidence:
+                Detection confidence score.
+            box:
+                Bounding box as (x, y, width, height).
+            class_id:
+                Numeric YOLO class ID.
         """
-        # Run inference
-        results = self.model(bgr_frame, conf=self.conf_thresh, verbose=False)
-        
+        yolo_results = self.model(
+            bgr_frame,
+            conf=self.confidence_threshold,
+            verbose=False,
+        )
+
         detections = []
-        if not results:
+
+        if not yolo_results:
             return detections
 
-        # Process results (usually there's only one item in results for a single image)
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                # Extract coordinates (x1, y1, x2, y2)
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                w = x2 - x1
-                h = y2 - y1
-                
-                class_id = int(box.cls[0])
-                confidence = float(box.conf[0])
-                
-                detections.append({
-                    "label":      self.classes[class_id],
-                    "confidence": confidence,
-                    "box":        (int(x1), int(y1), int(w), int(h)),
-                    "class_id":   class_id,
-                })
-                
+        for result in yolo_results:
+            for detected_box in result.boxes:
+                x_min, y_min, x_max, y_max = detected_box.xyxy[0].cpu().numpy()
+
+                box_width = x_max - x_min
+                box_height = y_max - y_min
+
+                class_id = int(detected_box.cls[0])
+                confidence = float(detected_box.conf[0])
+
+                detections.append(
+                    {
+                        "label": self.class_names[class_id],
+                        "confidence": confidence,
+                        "box": (
+                            int(x_min),
+                            int(y_min),
+                            int(box_width),
+                            int(box_height),
+                        ),
+                        "class_id": class_id,
+                    }
+                )
+
         return detections
 
     def annotate(self, bgr_frame: np.ndarray, detections: list[dict]) -> np.ndarray:
         """
-        Draw bounding boxes and labels onto a copy of *bgr_frame*.
-
-        Returns
-        -------
-        np.ndarray
-            Annotated BGR image (same resolution as input).
+        Draw detection boxes and labels on a copy of the input frame.
         """
-        annotated = bgr_frame.copy()
-        for det in detections:
-            x, y, w, h = det["box"]
-            color = [int(c) for c in self.colors[det["class_id"]]]
-            cv.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
-            label = f"{det['label']}: {det['confidence']:.2f}"
-            
-            # Draw a filled background rectangle behind the text for readability
-            (text_w, text_h), baseline = cv.getTextSize(
-                label, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1
-            )
+        annotated_frame = bgr_frame.copy()
+
+        for detection in detections:
+            x, y, box_width, box_height = detection["box"]
+            class_id = detection["class_id"]
+            box_color = [int(channel) for channel in self.class_colors[class_id]]
+
             cv.rectangle(
-                annotated,
-                (x, y - text_h - baseline - 4),
-                (x + text_w, y),
-                color,
+                annotated_frame,
+                (x, y),
+                (x + box_width, y + box_height),
+                box_color,
+                2,
+            )
+
+            label_text = f"{detection['label']}: {detection['confidence']:.2f}"
+
+            text_size, baseline = cv.getTextSize(
+                label_text,
+                cv.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                1,
+            )
+            text_width, text_height = text_size
+
+            cv.rectangle(
+                annotated_frame,
+                (x, y - text_height - baseline - 4),
+                (x + text_width, y),
+                box_color,
                 cv.FILLED,
             )
+
             cv.putText(
-                annotated,
-                label,
+                annotated_frame,
+                label_text,
                 (x, y - baseline - 2),
                 cv.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -143,4 +156,5 @@ class YOLODetector:
                 1,
                 cv.LINE_AA,
             )
-        return annotated
+
+        return annotated_frame

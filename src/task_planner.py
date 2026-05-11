@@ -1,39 +1,14 @@
 """
-task_planner.py — Task planner for PlanExecutor (Ollama or Google Gemini).
+task_planner.py — Task planner for PlanExecutor.
 
-The TaskPlanner subscribes to the "scene_state" topic on the SceneBus.
-It only calls the LLM when one of two conditions is true:
+The TaskPlanner listens for scene updates from the SceneBus and asks either
+Ollama or Google Gemini to create robot action plans.
 
-  1. prompt_user = True
-       No active task exists.  The planner prompts the operator via stdin
-       to provide a goal, then calls the LLM to build an initial plan.
+The planner calls the LLM when:
+- there is no active task and the operator needs to enter a goal
+- the executor reports a failure and the planner needs to replan
 
-  2. decision_needed = True
-       The executor reported a failure.  The planner calls the LLM with
-       the failure context and current scene state to produce a revised plan.
-
-The LLM call runs in a background thread so the Webots simulation loop
-(robot.step) is never blocked.
-
-External API:
-  planner = TaskPlanner()
-  planner.attach(bus)               # subscribe to scene_state
-  planner.report_failure(context)   # called by executor on step failure
-  planner.report_success()          # called by executor on task completion
-  planner.get_plan()                # returns latest plan dict or None
-  planner.is_planning()             # True while LLM is thinking
-
-Requirements:
-  1. Install Ollama:  https://ollama.com/download  (or: brew install ollama)
-  2. Pull the model:  ollama pull llama3.2-vision
-  3. Start server:    ollama serve          (runs on http://localhost:11434)
-
-Optional env vars (set in .env or shell):
-  TASK_PLANNER_BACKEND — "ollama" (default) or "gemini" for Google Gemini (same stack as simple_planner).
-  OLLAMA_MODEL  — model name, default "llama3.2-vision"
-  OLLAMA_HOST   — server URL, default "http://localhost:11434"
-  GEMINI_API_KEY or GOOGLE_API_KEY — required when backend is gemini
-  GEMINI_MODEL  — optional, default "gemini-2.0-flash"
+The LLM runs in a background thread so the Webots robot.step loop is not blocked.
 """
 
 import os
@@ -42,36 +17,28 @@ import threading
 import time
 from typing import Optional
 
-# ---------------------------------------------------------------------------
-# Optional: load .env automatically if python-dotenv is installed
-# ---------------------------------------------------------------------------
+
 try:
     from dotenv import load_dotenv
-    _root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    _env_path = os.path.join(_root_dir, ".env")
-    load_dotenv(_env_path, override=True)
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env_path = os.path.join(project_root, ".env")
+    load_dotenv(env_path, override=True)
 except ImportError:
-    pass  # python-dotenv not installed; rely on shell env vars
+    pass
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2-vision")
-OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
-_TASK_BACKEND_RAW = (os.getenv("TASK_PLANNER_BACKEND") or "ollama").strip().lower()
-if _TASK_BACKEND_RAW not in ("ollama", "gemini"):
-    _TASK_BACKEND_RAW = "ollama"
-TASK_PLANNER_BACKEND = _TASK_BACKEND_RAW
+backend_name = (os.getenv("TASK_PLANNER_BACKEND") or "ollama").strip().lower()
+if backend_name not in ("ollama", "gemini"):
+    backend_name = "ollama"
 
-# Maximum characters of joint data to send (cuts down token usage)
+TASK_PLANNER_BACKEND = backend_name
+
 MAX_JOINT_CHARS = 400
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """\
 You are a task planning agent for a NAO humanoid robot operating inside the
@@ -104,7 +71,7 @@ Primitive:
 Semantic (use when objects are detected):
   look_for_object      { "label": "<coco_name>", "timeout_s": <number> }
   center_on_object     { "label": "<coco_name>", "tolerance": 0.1, "timeout_s": 5 }
-    move_toward_object   { "label": "<coco_name>", "stop_distance_m": 0.45, "timeout_s": 24 }
+  move_toward_object   { "label": "<coco_name>", "stop_distance_m": 0.45, "timeout_s": 24 }
   pick_object          { "label": "<coco_name>" }
   place_object         {}
 
@@ -174,44 +141,39 @@ Always respond with a single valid JSON object — no markdown, no code fences:
 """
 
 
-# ---------------------------------------------------------------------------
-# TaskPlanner
-# ---------------------------------------------------------------------------
-
 class TaskPlanner:
     """
-    Task planning agent: Ollama (local) or Google Gemini (API), selected by
-    ``TASK_PLANNER_BACKEND`` (default: ollama).
+    Background task planner for the NAO robot.
 
-    Parameters
-    ----------
-    model   : Ollama model tag (default: llama3.2-vision); ignored when backend is gemini
-    host    : Ollama server URL (default: http://localhost:11434)
-    verbose : print LLM responses to stdout
+    The backend is selected with TASK_PLANNER_BACKEND:
+    - "ollama" uses a local Ollama model
+    - "gemini" uses Google Gemini through gemini_llm_connector
     """
 
     def __init__(
         self,
-        model:   str = DEFAULT_MODEL,
-        host:    str = OLLAMA_HOST,
+        model: str = DEFAULT_MODEL,
+        host: str = OLLAMA_HOST,
         verbose: bool = True,
     ):
-        self._model   = model
-        self._host    = host
+        self._model = model
+        self._host = host
         self._verbose = verbose
         self._backend = TASK_PLANNER_BACKEND
         self._client = None
-        self._gemini_ok = False
+        self._gemini_available = False
 
         if self._backend == "gemini":
             try:
                 from gemini_llm_connector import gemini_available
 
-                self._gemini_ok = bool(gemini_available())
+                self._gemini_available = bool(gemini_available())
             except ImportError:
-                self._gemini_ok = False
+                self._gemini_available = False
+
             gemini_model = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
-            if self._gemini_ok:
+
+            if self._gemini_available:
                 print(
                     f"[TaskPlanner] Backend: Gemini | model={gemini_model!r} "
                     f"(GEMINI_API_KEY / GOOGLE_API_KEY)"
@@ -221,167 +183,163 @@ class TaskPlanner:
                     "[TaskPlanner] TASK_PLANNER_BACKEND=gemini but Gemini is unavailable "
                     "(install google-genai, set GEMINI_API_KEY). Falling back to STUB."
                 )
+
         else:
-            # --- Lazy-import ollama (defer until after Webots connects) ---
             print("[TaskPlanner] Importing ollama…")
+
             try:
-                import ollama as _ollama
-                self._ollama = _ollama
+                import ollama as ollama_module
+
+                self._ollama = ollama_module
                 ollama_available = True
             except ImportError:
                 self._ollama = None
                 ollama_available = False
-                print("[TaskPlanner] WARNING: 'ollama' package not installed. "
-                      "Run: pip install ollama")
+                print(
+                    "[TaskPlanner] WARNING: 'ollama' package not installed. "
+                    "Run: pip install ollama"
+                )
 
-            # --- Verify the Ollama server is reachable ---
             if ollama_available:
                 try:
-                    client = _ollama.Client(host=host, timeout=60.0)
-                    client.list()
-                    self._client = client
-                    print(f"[TaskPlanner] Backend: Ollama | host={host} | model={model} (60s timeout)")
-                except Exception as e:
+                    ollama_client = ollama_module.Client(host=host, timeout=60.0)
+                    ollama_client.list()
+                    self._client = ollama_client
+                    print(
+                        f"[TaskPlanner] Backend: Ollama | host={host} | "
+                        f"model={model} (60s timeout)"
+                    )
+                except Exception as exc:
                     self._client = None
-                    print(f"[TaskPlanner] WARNING: Cannot reach Ollama server at {host}: {e}")
-                    print("[TaskPlanner] Make sure 'ollama serve' is running — falling back to STUB mode.")
+                    print(
+                        f"[TaskPlanner] WARNING: Cannot reach Ollama server at {host}: {exc}"
+                    )
+                    print(
+                        "[TaskPlanner] Make sure 'ollama serve' is running — "
+                        "falling back to STUB mode."
+                    )
             else:
                 self._client = None
 
-        # --- State ---
-        self._task:             Optional[str]  = None   # current goal string
-        self._prompt_user:      bool           = True   # True → need a task from user
-        self._decision_needed:  bool           = False  # True → executor reported failure
-        self._failure_context:  Optional[str]  = None   # description of what went wrong
-        self._planning:         bool           = False  # True while LLM thread is running
-        self._current_plan:     Optional[dict] = None   # latest plan returned by LLM
+        self._task: Optional[str] = None
+        self._prompt_user: bool = True
+        self._decision_needed: bool = False
+        self._failure_context: Optional[str] = None
+        self._planning: bool = False
+        self._current_plan: Optional[dict] = None
 
         self._lock = threading.Lock()
 
-    # ------------------------------------------------------------------
-    # Bus integration
-    # ------------------------------------------------------------------
-
     def attach(self, bus) -> None:
-        """Subscribe to the scene_state topic on *bus*."""
+        """Subscribe to scene and task-result updates."""
         bus.subscribe("scene_state", self._on_scene_published)
         bus.subscribe("task_result", self._on_task_result)
         print("[TaskPlanner] Attached to SceneBus.")
 
-    # ------------------------------------------------------------------
-    # Public control API (called by executor / external modules)
-    # ------------------------------------------------------------------
-
     def report_failure(self, context: str) -> None:
-        """
-        Signal that the current plan step failed.
-        The next published scene state will trigger a replan.
-        """
+        """Request a replan using the provided failure context."""
         with self._lock:
             self._decision_needed = True
             self._failure_context = context
+
         print(f"[TaskPlanner] Failure reported: {context}")
 
     def report_success(self) -> None:
-        """
-        Signal that the current task was completed successfully.
-        Resets to waiting-for-user mode.
-        """
+        """Reset the planner after a task completes."""
         with self._lock:
-            self._task            = None
-            self._prompt_user     = True
+            self._task = None
+            self._prompt_user = True
             self._decision_needed = False
             self._failure_context = None
-            self._current_plan    = None
+            self._current_plan = None
+
         print("[TaskPlanner] Task completed. Waiting for next user goal.")
 
     def get_plan(self) -> Optional[dict]:
-        """Return the most recently produced plan, or None."""
+        """Return the latest available plan."""
         with self._lock:
             return self._current_plan
+
     def consume_plan(self) -> None:
-        """Mark the current plan as consumed so it isn't re-executed."""
+        """Clear the current plan after the executor accepts it."""
         with self._lock:
             self._current_plan = None
 
     def is_planning(self) -> bool:
-        """True while the background LLM call is in progress."""
+        """Return True while a background planning call is running."""
         with self._lock:
             return self._planning
 
     def is_waiting_for_user(self) -> bool:
-        """True when the planner needs the operator to provide a task."""
+        """Return True when the planner needs a new operator goal."""
         with self._lock:
             return self._prompt_user
 
-    # ------------------------------------------------------------------
-    # Bus callbacks (called from the publisher's thread)
-    # ------------------------------------------------------------------
-
     def _on_scene_published(self, state: dict, snapshot_path: str) -> None:
-        """Called every time a scene_state is published on the bus."""
+        """Handle a new scene_state message from the SceneBus."""
         with self._lock:
             if self._planning:
-                return   # already thinking — don't stack calls
+                return
 
-            need_decision = self._decision_needed
-            need_user     = self._prompt_user
-            task          = self._task
-            failure_ctx   = self._failure_context
+            decision_needed = self._decision_needed
+            prompt_user = self._prompt_user
+            current_task = self._task
+            failure_context = self._failure_context
 
-        if need_decision:
-            # Executor reported a failure — replan in background
+        if decision_needed:
             print("\n[TaskPlanner] ⚡ Decision needed — starting replan…")
+
             with self._lock:
                 self._decision_needed = False
                 self._failure_context = None
-            self._start_planning_thread(task, state, snapshot_path, failure_ctx)
 
-        elif need_user:
-            # No active task — ask the operator in a background thread
+            self._start_planning_thread(
+                current_task,
+                state,
+                snapshot_path,
+                failure_context,
+            )
+
+        elif prompt_user:
             print("\n[TaskPlanner] 🤔 No active task — prompting operator…")
             self._start_user_input_thread(state, snapshot_path)
 
-        # else: task is running fine, no LLM call needed
-
     def _on_task_result(self, success: bool, context: str) -> None:
-        """Called when the executor publishes a task_result."""
+        """Handle executor success or failure reports."""
         if success:
             self.report_success()
         else:
             self.report_failure(context)
 
-    # ------------------------------------------------------------------
-    # Threading helpers
-    # ------------------------------------------------------------------
-
     def _start_user_input_thread(self, state: dict, snapshot_path: str) -> None:
+        """Start a background thread that asks the operator for a task."""
         with self._lock:
-            self._planning    = True
-            self._prompt_user = False   # prevent re-triggering while waiting
+            self._planning = True
+            self._prompt_user = False
 
-        t = threading.Thread(
+        user_input_thread = threading.Thread(
             target=self._user_input_worker,
             args=(state, snapshot_path),
             daemon=True,
             name="TaskPlanner-UserInput",
         )
-        t.start()
+        user_input_thread.start()
 
     def _user_input_worker(self, state: dict, snapshot_path: str) -> None:
-        """Runs in background: reads goal from operator, then calls LLM."""
+        """Read an operator goal, then build the first plan."""
         try:
             print("\n" + "=" * 60)
             print("  NAO TASK PLANNER — Enter your goal for the robot")
             print("  (The robot is ready and awaiting instructions)")
             print("=" * 60)
+
             task = input("  Goal > ").strip()
 
             if not task:
                 print("[TaskPlanner] No goal entered. Waiting for next scene state.")
                 with self._lock:
-                    self._planning    = False
-                    self._prompt_user = True   # re-enable prompt next cycle
+                    self._planning = False
+                    self._prompt_user = True
                 return
 
             with self._lock:
@@ -393,48 +351,46 @@ class TaskPlanner:
         except Exception as exc:
             print(f"[TaskPlanner] User input error: {exc}")
             with self._lock:
-                self._planning    = False
+                self._planning = False
                 self._prompt_user = True
 
     def _start_planning_thread(
         self,
-        task:            Optional[str],
-        state:           dict,
-        snapshot_path:   str,
+        task: Optional[str],
+        state: dict,
+        snapshot_path: str,
         failure_context: Optional[str],
     ) -> None:
+        """Start a background LLM planning thread."""
         with self._lock:
             self._planning = True
 
-        t = threading.Thread(
+        planning_thread = threading.Thread(
             target=self._do_plan,
             args=(task, state, snapshot_path, failure_context),
             daemon=True,
             name="TaskPlanner-LLM",
         )
-        t.start()
-
-    # ------------------------------------------------------------------
-    # Planning logic
-    # ------------------------------------------------------------------
+        planning_thread.start()
 
     def _do_plan(
         self,
-        task:            Optional[str],
-        state:           dict,
-        snapshot_path:   str,
+        task: Optional[str],
+        state: dict,
+        snapshot_path: str,
         failure_context: Optional[str],
     ) -> None:
-        """Calls the LLM and stores the result.  Always runs in a thread."""
-        t0 = time.time()
+        """Call the selected backend and store the resulting plan."""
+        start_time = time.time()
+
         try:
             plan = self._call_llm(task, state, snapshot_path, failure_context)
             plan = self._postprocess_plan(plan, task, state)
-            elapsed = time.time() - t0
+            elapsed = time.time() - start_time
 
             with self._lock:
                 self._current_plan = plan
-                self._planning     = False
+                self._planning = False
 
             self._print_plan(plan, elapsed)
 
@@ -443,41 +399,40 @@ class TaskPlanner:
             with self._lock:
                 self._planning = False
 
-    # ------------------------------------------------------------------
-    # LLM backends (Ollama / Gemini)
-    # ------------------------------------------------------------------
-
     def _build_user_text(
         self,
-        task:            Optional[str],
-        state:           dict,
+        task: Optional[str],
+        state: dict,
         failure_context: Optional[str],
     ) -> str:
-        """Plain user message for the task planner (Ollama or Gemini)."""
+        """Build the user message sent to Ollama or Gemini."""
         slim_state = self._slim_state(state)
-        text_parts = []
+        message_parts = []
+
         if failure_context:
-            text_parts.append(
+            message_parts.append(
                 f"REPLAN REQUEST\n"
                 f"The previous plan step failed:\n{failure_context}\n\n"
                 f"Please analyse the failure and produce a revised plan.\n"
             )
-        text_parts.append(
+
+        message_parts.append(
             f"TASK: {task or '(no task — ask for clarification)'}\n\n"
             f"CURRENT SCENE STATE:\n"
             f"{json.dumps(slim_state, indent=2)}"
         )
-        return "\n".join(text_parts)
+
+        return "\n".join(message_parts)
 
     def _call_llm(
         self,
-        task:            Optional[str],
-        state:           dict,
-        snapshot_path:   str,
+        task: Optional[str],
+        state: dict,
+        snapshot_path: str,
         failure_context: Optional[str],
     ) -> dict:
-        """Call configured backend; return parsed plan dict."""
-        if self._backend == "gemini" and self._gemini_ok:
+        """Call the configured backend and return a parsed plan dictionary."""
+        if self._backend == "gemini" and self._gemini_available:
             return self._call_gemini(task, state, snapshot_path, failure_context)
 
         if self._client is None:
@@ -486,67 +441,83 @@ class TaskPlanner:
         messages = self._build_messages(task, state, snapshot_path, failure_context)
 
         print(f"[TaskPlanner] Calling {self._model} via Ollama…")
+
         response = self._client.chat(
             model=self._model,
             messages=messages,
-            format="json",          # force JSON output mode
+            format="json",
             options={
-                "temperature":  0.2,
-                "num_predict":  2048,
+                "temperature": 0.2,
+                "num_predict": 2048,
             },
         )
 
-        raw = response.message.content
+        raw_response = response.message.content
+
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError as e:
-            print(f"[TaskPlanner] Could not parse Llama response as JSON: {e}")
-            print(f"[TaskPlanner] Raw response: {raw[:300]}…")
-            return {"raw_response": raw, "plan": [], "reasoning": "Parse error."}
+            return json.loads(raw_response)
+        except json.JSONDecodeError as exc:
+            print(f"[TaskPlanner] Could not parse Llama response as JSON: {exc}")
+            print(f"[TaskPlanner] Raw response: {raw_response[:300]}…")
+            return {
+                "raw_response": raw_response,
+                "plan": [],
+                "reasoning": "Parse error.",
+            }
 
     def _call_gemini(
         self,
-        task:            Optional[str],
-        state:           dict,
-        snapshot_path:   str,
+        task: Optional[str],
+        state: dict,
+        snapshot_path: str,
         failure_context: Optional[str],
     ) -> dict:
-        """Google Gemini with the same JSON plan schema as Ollama."""
+        """Call Gemini and return a task plan dictionary."""
         from gemini_llm_connector import extract_json_plan, gemini_generate_content
 
         user_text = self._build_user_text(task, state, failure_context)
-        snap = snapshot_path if (snapshot_path and os.path.isfile(snapshot_path)) else None
-        if snap:
-            print(f"[TaskPlanner] Gemini: attaching snapshot {os.path.basename(snap)}")
+
+        snapshot_file = (
+            snapshot_path
+            if snapshot_path and os.path.isfile(snapshot_path)
+            else None
+        )
+
+        if snapshot_file:
+            print(
+                f"[TaskPlanner] Gemini: attaching snapshot "
+                f"{os.path.basename(snapshot_file)}"
+            )
         else:
             print("[TaskPlanner] Gemini: text-only (no snapshot file on disk)")
 
         try:
-            raw = gemini_generate_content(
+            raw_response = gemini_generate_content(
                 user_text,
                 system_instruction=_SYSTEM_PROMPT,
-                snapshot_path=snap,
+                snapshot_path=snapshot_file,
             )
-        except Exception as e:
-            print(f"[TaskPlanner] Gemini request failed: {e}")
+        except Exception as exc:
+            print(f"[TaskPlanner] Gemini request failed: {exc}")
             return self._stub_plan(task, state)
 
-        plan = extract_json_plan(raw)
+        plan = extract_json_plan(raw_response)
+
         if not isinstance(plan, dict) or "plan" not in plan:
             print("[TaskPlanner] Gemini: response was not a valid task plan JSON.")
-            print(f"[TaskPlanner] Raw (truncated): {(raw or '')[:400]}…")
+            print(f"[TaskPlanner] Raw response: {(raw_response or '')[:400]}…")
             return self._stub_plan(task, state)
+
         return plan
 
     def _postprocess_plan(self, plan: dict, task: Optional[str], state: dict) -> dict:
         """
-        Apply a deterministic correction for visible-object tasks.
+        Replace blind movement with object-guided movement when the target is visible.
 
-        If the task clearly refers to an object that is visible in the current
-        scene, replace blind move-forward steps with object-guided motion.
+        This prevents the robot from ignoring useful YOLO detections.
         """
-        steps = plan.get("plan", []) if isinstance(plan, dict) else []
-        if not steps:
+        plan_steps = plan.get("plan", []) if isinstance(plan, dict) else []
+        if not plan_steps:
             return plan
 
         target_label = self._infer_target_label(task, state)
@@ -556,16 +527,30 @@ class TaskPlanner:
         if not self._is_object_visible(state, target_label):
             return plan
 
-        goal_text = (task or "").lower()
-        wants_grasp = any(word in goal_text for word in ("pick", "grab", "take", "lift", "collect"))
-        if not wants_grasp and not any(word in goal_text for word in ("walk to", "go to", "approach", "move to", "reach")):
+        task_text = (task or "").lower()
+
+        wants_grasp = any(
+            word in task_text
+            for word in ("pick", "grab", "take", "lift", "collect")
+        )
+
+        wants_approach = any(
+            word in task_text
+            for word in ("walk to", "go to", "approach", "move to", "reach")
+        )
+
+        if not wants_grasp and not wants_approach:
             return plan
 
         guided_steps = [
             {
                 "step": 1,
                 "action": "move_toward_object",
-                "parameters": {"label": target_label, "stop_distance_m": 0.40, "timeout_s": 24},
+                "parameters": {
+                    "label": target_label,
+                    "stop_distance_m": 0.40,
+                    "timeout_s": 24,
+                },
                 "description": f"Move toward the visible {target_label}.",
             },
         ]
@@ -580,19 +565,26 @@ class TaskPlanner:
                 }
             )
 
-        revised = dict(plan)
-        revised["plan"] = guided_steps
+        revised_plan = dict(plan)
+        revised_plan["plan"] = guided_steps
 
-        reasoning = revised.get("reasoning", "") or ""
-        note = f"Visible target '{target_label}' detected, so the plan was converted to object-guided motion."
-        revised["reasoning"] = f"{reasoning} {note}".strip()
-        return revised
+        existing_reasoning = revised_plan.get("reasoning", "") or ""
+        postprocess_note = (
+            f"Visible target '{target_label}' detected, so the plan was "
+            f"converted to object-guided motion."
+        )
+
+        revised_plan["reasoning"] = (
+            f"{existing_reasoning} {postprocess_note}".strip()
+        )
+
+        return revised_plan
 
     def _infer_target_label(self, task: Optional[str], state: dict) -> Optional[str]:
-        """Map a task description to a visible object label when possible."""
+        """Infer the COCO label that best matches the operator's task."""
         task_text = (task or "").lower()
 
-        aliases = {
+        label_aliases = {
             "dining table": ("wood table", "wooden table", "table"),
             "couch": ("couch", "sofa"),
             "bottle": ("bottle",),
@@ -603,103 +595,123 @@ class TaskPlanner:
             "person": ("person",),
         }
 
-        for canonical, words in aliases.items():
-            if any(word in task_text for word in words):
-                return canonical
+        for canonical_label, aliases in label_aliases.items():
+            if any(alias in task_text for alias in aliases):
+                return canonical_label
 
-        for obj in (state.get("scene", {}).get("objects") or state.get("objects", [])):
-            label = str(obj.get("label", "")).strip().lower()
-            if label and label in task_text:
-                return label
+        visible_objects = state.get("scene", {}).get("objects") or state.get("objects", [])
+
+        for detected_object in visible_objects:
+            detected_label = str(detected_object.get("label", "")).strip().lower()
+            if detected_label and detected_label in task_text:
+                return detected_label
 
         return None
 
     def _is_object_visible(self, state: dict, label: str) -> bool:
-        """Return True when the target label appears in scene.objects."""
-        target = label.strip().lower()
-        for obj in (state.get("scene", {}).get("objects") or state.get("objects", [])):
-            if str(obj.get("label", "")).strip().lower() == target:
+        """Return True if the requested object label is currently visible."""
+        target_label = label.strip().lower()
+        visible_objects = state.get("scene", {}).get("objects") or state.get("objects", [])
+
+        for detected_object in visible_objects:
+            detected_label = str(detected_object.get("label", "")).strip().lower()
+            if detected_label == target_label:
                 return True
+
         return False
 
     def _build_messages(
         self,
-        task:            Optional[str],
-        state:           dict,
-        snapshot_path:   str,
+        task: Optional[str],
+        state: dict,
+        snapshot_path: str,
         failure_context: Optional[str],
     ) -> list:
-        """
-        Build the Ollama messages list.
-        System prompt is a separate message; user text only (snapshot path is
-        passed to Gemini separately; Ollama path remains text-only for speed).
-        """
+        """Build the Ollama chat message list."""
         user_text = self._build_user_text(task, state, failure_context)
-        user_msg: dict = {"role": "user", "content": user_text}
+        user_message = {"role": "user", "content": user_text}
 
-        print("[TaskPlanner] Ollama: text-only user message (snapshot not attached).")
+        print("[TaskPlanner] Ollama: text-only user message.")
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            user_msg,
+            user_message,
         ]
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _slim_state(self, state: dict) -> dict:
-        """
-        Return a token-efficient copy of the state.
-        Keeps all high-level fields but truncates the verbose joint list.
-        """
+        """Return a smaller copy of the scene state for the LLM prompt."""
         import copy
-        slim = copy.deepcopy(state)
 
-        # Summarise joints as a short string instead of 25 individual floats
-        joints = slim.get("robot", {}).get("joint_positions", {})
-        if joints:
-            summary = {k: round(v, 2) for k, v in joints.items() if v is not None}
-            slim["robot"]["joint_positions"] = summary
+        slim_state = copy.deepcopy(state)
 
-        return slim
+        joint_positions = slim_state.get("robot", {}).get("joint_positions", {})
+        if joint_positions:
+            rounded_joint_positions = {
+                joint_name: round(joint_angle, 2)
+                for joint_name, joint_angle in joint_positions.items()
+                if joint_angle is not None
+            }
+            slim_state["robot"]["joint_positions"] = rounded_joint_positions
 
+        return slim_state
 
     def _stub_plan(self, task: Optional[str], state: dict) -> dict:
-        """Build a simple executable fallback plan when Ollama is unavailable."""
-        goal_text = (task or "").lower()
-        objects = (state.get("scene", {}).get("objects") or state.get("objects", []))
-        obj_names = [str(o.get("label", "")).lower() for o in objects if o.get("label")]
-        target_label = self._infer_target_label(task, state)
-        visible_target = target_label if target_label and self._is_object_visible(state, target_label) else None
+        """Build a safe fallback plan when no LLM backend is available."""
+        task_text = (task or "").lower()
+        visible_objects = state.get("scene", {}).get("objects") or state.get("objects", [])
 
-        if visible_target:
-            plan = [
+        visible_object_labels = [
+            str(detected_object.get("label", "")).lower()
+            for detected_object in visible_objects
+            if detected_object.get("label")
+        ]
+
+        target_label = self._infer_target_label(task, state)
+
+        visible_target_label = (
+            target_label
+            if target_label and self._is_object_visible(state, target_label)
+            else None
+        )
+
+        if visible_target_label:
+            plan_steps = [
                 {
                     "step": 1,
                     "action": "move_toward_object",
-                    "parameters": {"label": visible_target, "stop_distance_m": 0.40, "timeout_s": 24},
-                    "description": f"Move toward the visible {visible_target}.",
+                    "parameters": {
+                        "label": visible_target_label,
+                        "stop_distance_m": 0.40,
+                        "timeout_s": 24,
+                    },
+                    "description": f"Move toward the visible {visible_target_label}.",
                 },
             ]
-            if any(word in goal_text for word in ("pick", "grab", "take", "lift", "collect")):
-                plan.append(
+
+            if any(
+                word in task_text
+                for word in ("pick", "grab", "take", "lift", "collect")
+            ):
+                plan_steps.append(
                     {
                         "step": 2,
                         "action": "pick_object",
-                        "parameters": {"label": visible_target},
-                        "description": f"Pick up the {visible_target}.",
+                        "parameters": {"label": visible_target_label},
+                        "description": f"Pick up the {visible_target_label}.",
                     }
                 )
-            summary = f"Move toward the visible {visible_target}."
+
+            task_summary = f"Move toward the visible {visible_target_label}."
+
             reasoning = (
                 f"[FALLBACK — Ollama not connected] Task: '{task}'. "
-                f"Detected objects: {obj_names}. "
-                f"Using the visible target '{visible_target}' with supported executor actions."
+                f"Detected objects: {visible_object_labels}. "
+                f"Using the visible target '{visible_target_label}' with supported "
+                f"executor actions."
             )
+
         else:
-            # Conservative blind motion so the robot still does something useful.
-            plan = [
+            plan_steps = [
                 {
                     "step": 1,
                     "action": "turn_left",
@@ -719,61 +731,67 @@ class TaskPlanner:
                     "description": "Stop and wait for the next scene update.",
                 },
             ]
-            summary = task or "Unknown task"
+
+            task_summary = task or "Unknown task"
+
             reasoning = (
                 f"[FALLBACK — Ollama not connected] Task: '{task}'. "
-                f"Detected objects: {obj_names}. "
-                f"No visible target was found, so the robot will make a conservative blind approach."
+                f"Detected objects: {visible_object_labels}. "
+                f"No visible target was found, so the robot will make a conservative "
+                f"blind approach."
             )
 
         return {
             "reasoning": reasoning,
-            "task_summary": summary,
-            "plan": plan,
+            "task_summary": task_summary,
+            "plan": plan_steps,
             "requires_clarification": False,
             "clarification_question": None,
             "estimated_duration_s": 8,
         }
 
     def _print_plan(self, plan: dict, elapsed: float) -> None:
-        """Pretty-print the plan to stdout."""
-        BOLD   = "\033[1m"
-        CYAN   = "\033[36m"
-        YELLOW = "\033[33m"
-        GREEN  = "\033[32m"
-        DIM    = "\033[2m"
-        RESET  = "\033[0m"
+        """Print the generated plan."""
+        bold = "\033[1m"
+        cyan = "\033[36m"
+        yellow = "\033[33m"
+        green = "\033[32m"
+        dim = "\033[2m"
+        reset = "\033[0m"
 
-        sep = f"{CYAN}{'─' * 60}{RESET}"
-        print(f"\n{sep}")
-        print(f"{BOLD}  TASK PLANNER — New Plan  {DIM}({elapsed:.1f}s){RESET}")
-        print(sep)
+        separator = f"{cyan}{'─' * 60}{reset}"
 
-        print(f"\n{BOLD}Task:{RESET}     {plan.get('task_summary', '?')}")
-        print(f"{BOLD}Duration:{RESET} ~{plan.get('estimated_duration_s', '?')}s")
+        print(f"\n{separator}")
+        print(f"{bold}  TASK PLANNER — New Plan  {dim}({elapsed:.1f}s){reset}")
+        print(separator)
+
+        print(f"\n{bold}Task:{reset}     {plan.get('task_summary', '?')}")
+        print(f"{bold}Duration:{reset} ~{plan.get('estimated_duration_s', '?')}s")
 
         if plan.get("requires_clarification"):
-            print(f"\n{YELLOW}⚠ Clarification needed:{RESET} "
-                  f"{plan.get('clarification_question')}")
+            print(
+                f"\n{yellow}⚠ Clarification needed:{reset} "
+                f"{plan.get('clarification_question')}"
+            )
 
-        print(f"\n{BOLD}Reasoning:{RESET}")
-        for line in (plan.get("reasoning") or "").split(". "):
-            if line.strip():
-                print(f"  • {line.strip()}.")
+        print(f"\n{bold}Reasoning:{reset}")
+        for reasoning_line in (plan.get("reasoning") or "").split(". "):
+            if reasoning_line.strip():
+                print(f"  • {reasoning_line.strip()}.")
 
         steps = plan.get("plan", [])
         if steps:
-            print(f"\n{BOLD}Steps:{RESET}")
-            for s in steps:
+            print(f"\n{bold}Steps:{reset}")
+            for step in steps:
                 print(
-                    f"  {GREEN}[{s.get('step', '?')}]{RESET} "
-                    f"{BOLD}{s.get('action', '?')}{RESET}  —  "
-                    f"{s.get('description', '')}"
+                    f"  {green}[{step.get('step', '?')}]{reset} "
+                    f"{bold}{step.get('action', '?')}{reset}  —  "
+                    f"{step.get('description', '')}"
                 )
-                if s.get("parameters"):
-                    print(f"      params: {s['parameters']}")
+                if step.get("parameters"):
+                    print(f"      params: {step['parameters']}")
 
         if self._verbose:
-            print(f"\n{DIM}Full JSON:\n{json.dumps(plan, indent=2)}{RESET}")
+            print(f"\n{dim}Full JSON:\n{json.dumps(plan, indent=2)}{reset}")
 
-        print(f"\n{sep}\n")
+        print(f"\n{separator}\n")

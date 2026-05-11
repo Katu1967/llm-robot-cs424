@@ -37,25 +37,22 @@ class SceneBus:
     """
 
     def __init__(self):
-        self._subscribers: dict[str, list[Callable]] = defaultdict(list)
-        self._lock = threading.Lock()
-        self._latest: dict[str, tuple] = {}
+        self._topic_subscribers: dict[str, list[Callable]] = defaultdict(list)
+        self._thread_lock = threading.Lock()
+        self._latest_payloads: dict[str, tuple] = {}
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def subscribe(self, topic: str, callback: Callable) -> None:
         """Register *callback* to be called whenever *topic* is published."""
-        with self._lock:
-            self._subscribers[topic].append(callback)
+        with self._thread_lock:
+            self._topic_subscribers[topic].append(callback)
         print(f"[SceneBus] Subscribed to '{topic}': {callback.__qualname__}")
 
     def unsubscribe(self, topic: str, callback: Callable) -> None:
         """Remove a previously registered callback."""
-        with self._lock:
+        with self._thread_lock:
             try:
-                self._subscribers[topic].remove(callback)
+                self._topic_subscribers[topic].remove(callback)
             except ValueError:
                 pass
 
@@ -66,21 +63,17 @@ class SceneBus:
         Returns the number of subscribers that were called.
         Subscriber exceptions are caught and printed but do NOT propagate.
         """
-        with self._lock:
-            callbacks = list(self._subscribers.get(topic, []))
+        with self._thread_lock:
+            callbacks = list(self._topic_subscribers.get(topic, []))
 
-        for cb in callbacks:
+        for callback in callbacks:
             try:
-                cb(*args, **kwargs)
+                callback(*args, **kwargs)
             except Exception as exc:
-                print(f"[SceneBus] ERROR — subscriber {cb.__qualname__} "
+                print(f"[SceneBus] ERROR — subscriber {callback.__qualname__} "
                       f"raised on topic '{topic}': {exc}")
-        # Cache the most-recent payload for simple query access (e.g. by
-        # PlanExecutor) so subscribers can also query the last published
-        # scene state without needing to be called directly.
         try:
-            # Store the raw args tuple and kwargs dict for the topic
-            self._latest[topic] = (args, kwargs)
+            self._latest_payloads[topic] = (args, kwargs)
         except Exception:
             pass
 
@@ -89,18 +82,17 @@ class SceneBus:
     def get_latest(self, topic: str):
         """Return the most-recent payload published to *topic*.
 
-        For compatibility with existing code this returns the first positional
-        argument if present (e.g. the `state` dict for "scene_state"), or
-        None if nothing has been published yet.
+        Returns the first positional argument if present (e.g. the `state` dict
+        for "scene_state"), or None if nothing has been published yet.
         """
-        with self._lock:
-            val = self._latest.get(topic)
-        if not val:
+        with self._thread_lock:
+            payload_tuple = self._latest_payloads.get(topic)
+        if not payload_tuple:
             return None
-        args, kwargs = val
+        args, kwargs = payload_tuple
         return args[0] if args else None
 
     def topics(self) -> list[str]:
         """Return a list of topics that have at least one subscriber."""
-        with self._lock:
-            return [t for t, subs in self._subscribers.items() if subs]
+        with self._thread_lock:
+            return [topic for topic, subscribers in self._topic_subscribers.items() if subscribers]

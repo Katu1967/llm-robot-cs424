@@ -67,13 +67,13 @@ def request_capture(reason: str = "external") -> None:
 def goal_requires_locate_first(goal: str) -> bool:
     if not goal:
         return False
-    g = goal.lower()
-    phrases = (
+    goal_lower = goal.lower()
+    nav_keywords = (
         "go to", "walk to", "move to", "approach", "head to", "get to",
         "navigate to", "travel to", "reach the", "reach a ", "find the",
         "find a ", "locate ", "locate the",
     )
-    return any(p in g for p in phrases)
+    return any(keyword in goal_lower for keyword in nav_keywords)
 
 
 def _meters_to_feet(m: float) -> float:
@@ -106,29 +106,29 @@ def main():
 
     last_scene_state = [None]
     last_snapshot_path = [None]
-    nav_locate_complete = [False]
-    search_mode = [False]
-    search_aliases: List[str] = []
-    approach_active = [False]
+    locate_object_found = [False]
+    in_search_mode = [False]
+    search_target_aliases: List[str] = []
+    is_approaching_target = [False]
 
     def aliases_compatible(plan_aliases: list, target: List[str]) -> bool:
-        pa = set(normalize_aliases([str(a) for a in (plan_aliases or [])]))
-        ta = set(normalize_aliases(list(target)))
-        if not pa or not ta:
+        plan_aliases_set = set(normalize_aliases([str(a) for a in (plan_aliases or [])]))
+        target_aliases_set = set(normalize_aliases(list(target)))
+        if not plan_aliases_set or not target_aliases_set:
             return False
-        return bool(pa & ta) or pa <= ta or ta <= pa
+        return bool(plan_aliases_set & target_aliases_set) or plan_aliases_set <= target_aliases_set or target_aliases_set <= plan_aliases_set
 
     def merge_object_in_view_context(base: str) -> str:
         """Append OBJECT_IN_VIEW when SEARCH_MODE sees the target (YOLO)."""
-        if not search_mode[0] or not search_aliases:
+        if not in_search_mode[0] or not search_target_aliases:
             return base
-        st = last_scene_state[0]
-        m = match_target_in_scene(st, search_aliases)
-        if not m:
+        current_state = last_scene_state[0]
+        matched_target = match_target_in_scene(current_state, search_target_aliases)
+        if not matched_target:
             return base
-        lbl, obj = m
-        nav_locate_complete[0] = True
-        line = format_object_in_view_line(lbl, obj)
+        label, object_data = matched_target
+        locate_object_found[0] = True
+        line = format_object_in_view_line(label, object_data)
         if "OBJECT_IN_VIEW:" in base:
             return base
         return f"{base}\n{line}"
@@ -146,37 +146,34 @@ def main():
             )
             return
         if context.startswith("FOUND:"):
-            nav_locate_complete[0] = True
+            locate_object_found[0] = True
         elif context.startswith("TIMEOUT:"):
-            nav_locate_complete[0] = False
+            locate_object_found[0] = False
         if context.startswith("LOST:"):
-            nav_locate_complete[0] = False
-            search_mode[0] = True
-            approach_active[0] = False
+            locate_object_found[0] = False
+            in_search_mode[0] = True
+            is_approaching_target[0] = False
         if context.startswith("STUCK:"):
-            approach_active[0] = False
+            is_approaching_target[0] = False
         if context.startswith("SUPER_CLOSE:"):
-            approach_active[0] = False
+            is_approaching_target[0] = False
             ft_line = ""
             if obj:
                 dm = obj.get("distance_m")
                 try:
                     if dm is not None:
-                        m = float(dm)
-                        ft_line = f" Final RangeFinder distance ≈ {_meters_to_feet(m):.2f} ft ({m:.3f} m)."
+                        distance_meters = float(dm)
+                        ft_line = f" Final RangeFinder distance ≈ {_meters_to_feet(distance_meters):.2f} ft ({distance_meters:.3f} m)."
                 except (TypeError, ValueError):
                     pass
             print("[simple_controller] Final approach (SUPER_CLOSE) met. Asking LLM for next step..." + ft_line)
             
-            # Keep these resets, but DO NOT clear goal_active or planner.set_goal
-            search_mode[0] = False
-            search_aliases.clear()
-            nav_locate_complete[0] = False
-            
-            # The return statement has been removed here so it successfully falls through to planner.request_plan()
+            in_search_mode[0] = False
+            search_target_aliases.clear()
+            locate_object_found[0] = False
             
         ctx = merge_object_in_view_context(context)
-        if approach_active[0] and context.startswith("STEP_DONE"):
+        if is_approaching_target[0] and context.startswith("STEP_DONE"):
             ctx = (
                 f"APPROACH_INTERRUPT: A dodge step finished while still "
                 f"navigating toward the goal object.\n{ctx}"
@@ -214,13 +211,13 @@ def main():
             last_detections = stab.update(detector.detect(bgr))
 
         display = bgr.copy()
-        for d in last_detections:
-            x, y, w, h = d["box"]
-            cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        for detection in last_detections:
+            box_x, box_y, box_w, box_h = detection["box"]
+            cv2.rectangle(display, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 255, 0), 2)
             cv2.putText(
                 display,
-                f"{d['label']} {d['confidence']:.2f}",
-                (x, max(y - 6, 0)),
+                f"{detection['label']} {detection['confidence']:.2f}",
+                (box_x, max(box_y - 6, 0)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (0, 255, 0),
@@ -228,8 +225,8 @@ def main():
             )
 
         status = "SPACE: set goal  |  q: quit"
-        if goal_active or search_mode[0]:
-            tag = "SEARCH" if search_mode[0] and executor.is_idle else "Running"
+        if goal_active or in_search_mode[0]:
+            tag = "SEARCH" if in_search_mode[0] and executor.is_idle else "Running"
             status = f"{tag}…  |  q: quit"
         elif planner.is_planning():
             status = "LLM thinking…"
@@ -237,8 +234,8 @@ def main():
         cv2.imshow("NAO — Simple Controller", display)
 
         if SHOW_DEPTH:
-            rf = extractor.range_finder
-            if rf is None:
+            rangefinder = extractor.range_finder
+            if rangefinder is None:
                 blank = np.zeros((max(120, cam_h // 4), max(200, cam_w // 2), 3), dtype=np.uint8)
                 cv2.putText(
                     blank,
@@ -253,21 +250,21 @@ def main():
                 cv2.imshow(DEPTH_WINDOW, blank)
             else:
                 try:
-                    dhw = read_range_depth_hw(rf)
-                    if dhw is not None:
-                        mn = float(rf.getMinRange())
-                        mx = float(rf.getMaxRange())
-                        vis = depth_hw_to_bgr_vis(dhw, mn, mx)
-                        scale = max(2, int(round(cam_h / max(1, vis.shape[0]))))
+                    depth_array = read_range_depth_hw(rangefinder)
+                    if depth_array is not None:
+                        min_range = float(rangefinder.getMinRange())
+                        max_range = float(rangefinder.getMaxRange())
+                        visualization = depth_hw_to_bgr_vis(depth_array, min_range, max_range)
+                        scale = max(2, int(round(cam_h / max(1, visualization.shape[0]))))
                         if scale > 1:
-                            vis = cv2.resize(
-                                vis,
-                                (vis.shape[1] * scale, vis.shape[0] * scale),
+                            visualization = cv2.resize(
+                                visualization,
+                                (visualization.shape[1] * scale, visualization.shape[0] * scale),
                                 interpolation=cv2.INTER_NEAREST,
                             )
                         cv2.putText(
-                            vis,
-                            f"Range {mn:.2f}-{mx:.1f} m (color = depth)",
+                            visualization,
+                            f"Range {min_range:.2f}-{max_range:.1f} m (color = depth)",
                             (6, 20),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
@@ -275,7 +272,7 @@ def main():
                             1,
                             cv2.LINE_AA,
                         )
-                        cv2.imshow(DEPTH_WINDOW, vis)
+                        cv2.imshow(DEPTH_WINDOW, visualization)
                     else:
                         blank = np.zeros((max(120, cam_h // 4), max(200, cam_w // 2), 3), dtype=np.uint8)
                         cv2.putText(
@@ -320,7 +317,7 @@ def main():
             trigger = "manual_keypress"
         elif ext_trigger:
             trigger = ext_trigger
-        elif goal_active or search_mode[0]:
+        elif goal_active or in_search_mode[0]:
             trigger = "search_live"
 
         if trigger is not None:
@@ -342,7 +339,7 @@ def main():
                 last_snapshot_path[0] = snap
             bus.publish("scene_state", state, snap)
 
-        if space_pressed and not goal_prompted and not goal_active and not search_mode[0] and not planner.is_planning():
+        if space_pressed and not goal_prompted and not goal_active and not in_search_mode[0] and not planner.is_planning():
             goal_prompted = True
 
             def _ask_goal():
@@ -352,9 +349,9 @@ def main():
                 goal = input("  Goal > ").strip()
                 if not goal:
                     return
-                nav_locate_complete[0] = False
-                search_mode[0] = False
-                search_aliases.clear()
+                locate_object_found[0] = False
+                in_search_mode[0] = False
+                search_target_aliases.clear()
                 planner.set_goal(goal)
                 stab.reset()
                 print(f"[simple_controller] Goal set: '{goal}'")
@@ -371,10 +368,10 @@ def main():
                 nav_goal = goal_requires_locate_first(goal_txt)
 
                 if executor.is_approaching:
-                    cur = executor.approach_aliases
+                    current_aliases = executor.approach_aliases
                     if action == "move_to_object":
-                        pa = plan.get("aliases", [])
-                        if aliases_compatible(pa, cur):
+                        plan_aliases = plan.get("aliases", [])
+                        if aliases_compatible(plan_aliases, current_aliases):
                             executor.clear_replan_pause()
                             executor.resume_approach_walk()
                             print("[simple_controller] LLM continue approach (move_to_object).")
@@ -384,20 +381,20 @@ def main():
                                 last_snapshot_path[0],
                                 context=(
                                     "ERROR: During APPROACH_CHECKPOINT use the **same aliases** "
-                                    f"as the active approach {cur!r}, or turn_degrees / move_forward."
+                                    f"as the active approach {current_aliases!r}, or turn_degrees / move_forward."
                                 ),
                             )
                     elif action == "turn_degrees":
                         try:
-                            deg = float(plan.get("degrees", 25))
+                            degrees = float(plan.get("degrees", 25))
                         except (TypeError, ValueError):
-                            deg = 25.0
-                        deg = max(-90.0, min(90.0, deg))
+                            degrees = 25.0
+                        degrees = max(-90.0, min(90.0, degrees))
                         executor.stop_approach_soft()
                         goal_active = True
                         goal_prompted = False
-                        print(f"[simple_controller] Approach dodge: turn {deg:+.1f}°")
-                        executor.start_step_turn(deg, feedback_aliases=list(cur), track_head=True)
+                        print(f"[simple_controller] Approach dodge: turn {degrees:+.1f}°")
+                        executor.start_step_turn(degrees, feedback_aliases=list(current_aliases), track_head=True)
                     elif action == "move_forward":
                         try:
                             meters = float(plan.get("meters", 0.35))
@@ -408,7 +405,7 @@ def main():
                         goal_active = True
                         goal_prompted = False
                         print(f"[simple_controller] Approach dodge: move_forward {meters:.2f} m")
-                        executor.start_step_forward(meters, feedback_aliases=list(cur), track_head=True)
+                        executor.start_step_forward(meters, feedback_aliases=list(current_aliases), track_head=True)
                     elif action in ("look_up", "look_down"):
                         planner.request_plan(
                             last_scene_state[0] or {},
@@ -420,18 +417,18 @@ def main():
                             ),
                         )
                     elif action == "done":
-                        approach_active[0] = False
+                        is_approaching_target[0] = False
                         executor.stop()
                         msg = plan.get("message", "Approach aborted by planner.")
                         print(f"\n[simple_controller] LLM done during approach: {msg}")
                         goal_active = False
                         goal_prompted = False
-                        search_mode[0] = False
-                        search_aliases.clear()
-                        nav_locate_complete[0] = False
+                        in_search_mode[0] = False
+                        search_target_aliases.clear()
+                        locate_object_found[0] = False
                         planner.set_goal("")
                     elif action == "fail":
-                        approach_active[0] = False
+                        is_approaching_target[0] = False
                         executor.stop()
                         reason = plan.get("reason", plan.get("message", "unspecified"))
                         print(f"\n[simple_controller] LLM fail during approach: {reason}")
@@ -452,7 +449,7 @@ def main():
                     if (
                         action == "move_to_object"
                         and nav_goal
-                        and not nav_locate_complete[0]
+                        and not locate_object_found[0]
                     ):
                         print(
                             "[simple_controller] Policy: move_to_object before OBJECT_IN_VIEW "
@@ -464,23 +461,23 @@ def main():
                     if action == "locate_object":
                         aliases = plan.get("aliases", [])
                         if aliases:
-                            search_aliases.clear()
-                            search_aliases.extend(
+                            search_target_aliases.clear()
+                            search_target_aliases.extend(
                                 [a.lower().strip() for a in aliases if a and str(a).strip()]
                             )
-                            search_mode[0] = True
-                            nav_locate_complete[0] = False
+                            in_search_mode[0] = True
+                            locate_object_found[0] = False
                             goal_active = True
                             goal_prompted = False
                             executor.start_locate(aliases)
                             print(
-                                f"[simple_controller] SEARCH_MODE + spin — aliases={search_aliases}"
+                                f"[simple_controller] SEARCH_MODE + spin — aliases={search_target_aliases}"
                             )
                         else:
                             print("[simple_controller] Warning: locate_object has no aliases.")
 
                     elif action == "move_forward":
-                        if nav_goal and not search_mode[0]:
+                        if nav_goal and not in_search_mode[0]:
                             print(
                                 "[simple_controller] Rejecting move_forward before SEARCH_MODE."
                             )
@@ -515,7 +512,7 @@ def main():
                         print("[simple_controller] LLM pick_object command received.")
                         executor.start_pick()
                     elif action == "turn_degrees":
-                        if nav_goal and not search_mode[0]:
+                        if nav_goal and not in_search_mode[0]:
                             print(
                                 "[simple_controller] Rejecting turn_degrees before SEARCH_MODE."
                             )
@@ -529,13 +526,13 @@ def main():
                             )
                         else:
                             try:
-                                deg = float(plan.get("degrees", 45))
+                                degrees = float(plan.get("degrees", 45))
                             except (TypeError, ValueError):
-                                deg = 45.0
+                                degrees = 45.0
                             goal_active = True
                             goal_prompted = False
-                            print(f"[simple_controller] LLM turn_degrees: {deg:+.1f}°")
-                            executor.start_step_turn(deg)
+                            print(f"[simple_controller] LLM turn_degrees: {degrees:+.1f}°")
+                            executor.start_step_turn(degrees)
 
                     elif action in ("look_up", "look_down"):
                         planner.request_plan(
@@ -552,10 +549,10 @@ def main():
                     elif action == "move_to_object":
                         aliases = plan.get("aliases", [])
                         if aliases:
-                            search_mode[0] = False
+                            in_search_mode[0] = False
                             goal_active = True
                             goal_prompted = False
-                            approach_active[0] = True
+                            is_approaching_target[0] = True
                             print(f"[simple_controller] Starting approach for: {aliases}")
                             executor.start_move(aliases)
                         else:
@@ -567,10 +564,10 @@ def main():
                         print("[simple_controller] Goal complete — press SPACE for a new goal.\n")
                         goal_active = False
                         goal_prompted = False
-                        search_mode[0] = False
-                        search_aliases.clear()
-                        nav_locate_complete[0] = False
-                        approach_active[0] = False
+                        in_search_mode[0] = False
+                        search_target_aliases.clear()
+                        locate_object_found[0] = False
+                        is_approaching_target[0] = False
                         planner.set_goal("")
 
                     elif action == "fail":
@@ -612,7 +609,7 @@ def main():
             and not planner.has_plan()
             and not planner.is_planning()
         ):
-            if not search_mode[0]:
+            if not in_search_mode[0]:
                 goal_active = False
                 goal_prompted = False
 

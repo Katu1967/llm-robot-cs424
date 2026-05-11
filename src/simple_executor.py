@@ -7,23 +7,19 @@ from simple_search import format_feedback_line, match_target_in_scene
 
 class SimpleExecutor:
     """
-    locate_object: 360° spin + YOLO verify (FOUND / TIMEOUT); **head stays neutral** during spin and verify (no bbox tracking).
-    move_to_object: vision-guided walk; **depth** ``distance_m`` ends the approach at **STOP_DISTANCE_M**
-    (~2 ft default) when the RangeFinder reports depth. Without depth, bbox / creep heuristics approximate "close enough".
-    Periodic **APPROACH_CHECKPOINT** (~10 s) pauses feet (no Stand) for LLM safety replanning.
-    Head **continuously tracks** the target bbox (including brief occlusion, verify pause, and dodge steps).
-
-    LLM primitives: move_forward, turn_degrees.
-
-    Controller also merges OBJECT_IN_VIEW from scene polling during SEARCH_MODE.
+    Executor for NAO robot navigation and object approach.
+    
+    locate_object: 360° spin + YOLO verify (FOUND / TIMEOUT).
+    move_to_object: vision-guided walk toward target, stops at STOP_DISTANCE_M by RangeFinder depth.
+    Periodic APPROACH_CHECKPOINT pauses for LLM safety replanning (~10s).
+    Head continuously tracks target bbox during approach.
     """
 
-    SPIN_DURATION_S       = 15.0    # full rotation search budget
+    SPIN_DURATION_S       = 15.0
     POLL_INTERVAL_S       = 0.05
     STUCK_THRESHOLD_S     = 2.0
 
     MOVE_CHECKPOINT_S = float(os.getenv("SIMPLE_MOVE_CHECKPOINT_S", "8.0"))
-    # During move_to_object: pause feet + LLM replan on this cadence (seconds).
     APPROACH_REPLAN_S = float(os.getenv("SIMPLE_APPROACH_REPLAN_S", "10.0"))
 
     FORWARD_MPS = float(os.getenv("SIMPLE_FORWARD_MPS", "0.10"))
@@ -35,15 +31,12 @@ class SimpleExecutor:
     MIN_STEP_M = 0.05
     MAX_STEP_M = 2.5
 
-    # Final approach during move_to_object: slow creep until bbox is very large + centered.
     CREEP_ENTER_HF = float(os.getenv("SIMPLE_CREEP_ENTER_HF", "0.42"))
     SUPER_CLOSE_HF = float(os.getenv("SIMPLE_SUPER_CLOSE_HF", "0.62"))
     FINAL_CREEP_TIMEOUT_S = float(os.getenv("SIMPLE_FINAL_CREEP_TIMEOUT_S", "7.0"))
     FORCE_SUPER_CLOSE_HF = float(os.getenv("SIMPLE_FORCE_SUPER_CLOSE_HF", "0.56"))
-    # ~2 feet (0.6096 m) — RangeFinder depth at bbox when roughly centered ends approach.
     STOP_DISTANCE_M = float(os.getenv("SIMPLE_STOP_DISTANCE_M", "0.22"))
 
-    # Lower alpha / gain = smoother pitch; bbox cy jitters less on the motors.
     _follow_look_alpha = float(os.getenv("NAO_FOLLOW_LOOK_ALPHA", "0.14"))
     _follow_pitch_gain = float(os.getenv("NAO_FOLLOW_PITCH_GAIN", "0.26"))
     _head_cy_deadband = float(os.getenv("SIMPLE_HEAD_CY_DEADBAND", "0.07"))
@@ -53,13 +46,13 @@ class SimpleExecutor:
         self._bus        = bus
         self._on_status  = on_status
 
-        self._mode:       str   = "IDLE"   # LOCATE, VERIFY_LOCATE, MOVE, STEP_*, IDLE
+        self._mode:       str   = "IDLE"
         self._aliases:    list  = []
         self._elapsed:    float = 0.0
         self._last_poll:  float = 0.0
 
         self._locate_seen_time: float = 0.0
-        self._verify_timer:    float = 0.0
+        self._verify_timer:     float = 0.0
 
         self._target_label:     Optional[str] = None
         self._max_h_frac:       float         = 0.0
@@ -67,23 +60,23 @@ class SimpleExecutor:
         self._checkpoint_timer: float         = 0.0
         self._recovery_timer:   float         = 0.0
 
-        self._prim_elapsed:       float = 0.0
-        self._step_target_m:      float = 0.0
+        self._prim_elapsed:      float = 0.0
+        self._step_target_m:     float = 0.0
         self._step_start_xy:     Optional[Tuple[float, float]] = None
         self._step_time_budget:  float = 0.0
         self._turn_target_deg:   float = 0.0
         self._turn_time_budget:  float = 0.0
-        self._feedback_aliases: Optional[List[str]] = None
+        self._feedback_aliases:  Optional[List[str]] = None
         self._final_creep_start: Optional[float] = None
-        self._replan_pause: bool = False
-        self._last_known_dist_m = None
-        self._last_follow_cx: Optional[float] = None
-        self._last_follow_cy: Optional[float] = None
-        self._last_follow_pos: str = "center"
+        self._replan_pause:      bool = False
+        
+        self._last_known_dist_m: Optional[float] = None
+        self._last_follow_cx:    Optional[float] = None
+        self._last_follow_cy:    Optional[float] = None
+        self._last_follow_pos:   str = "center"
         self._last_follow_valid: bool = False
-        self._step_track_head: bool = False
-        self._last_known_dist_m: Optional[float] = None   # <--- ADD THIS
-        self._blind_move_timer: float = 0.0               # <--- ADD THIS
+        self._step_track_head:   bool = False
+        self._blind_move_timer:  float = 0.0
         self._blind_move_budget: float = 0.0
 
     @property
@@ -96,27 +89,22 @@ class SimpleExecutor:
 
     @property
     def approach_aliases(self) -> List[str]:
-        """Aliases for the current ``move_to_object`` (MOVE mode), else empty."""
         return list(self._aliases) if self._mode == "MOVE" else []
 
     def clear_replan_pause(self) -> None:
-        """Resume walking after an LLM replan approved continue (controller calls this)."""
         self._replan_pause = False
 
     def resume_approach_walk(self) -> None:
-        """Restart forward approach motion while still in MOVE mode."""
         if self._mode == "MOVE":
             self._robot.start_walk(vx=self.APPROACH_VX)
 
     def stop_approach_soft(self) -> None:
-        """Leave MOVE without Stand/rest — for dodge primitives (turn / short move)."""
         if self._mode == "MOVE":
             self._replan_pause = False
             self._robot.stop_locomotion_only()
             self._mode = "IDLE"
 
     def start_locate(self, aliases: list) -> None:
-        """Spin ~360° while polling scene for target; FOUND after verify or TIMEOUT."""
         self._mode             = "LOCATE"
         self._aliases          = [a.lower().strip() for a in aliases]
         self._elapsed          = 0.0
@@ -139,14 +127,13 @@ class SimpleExecutor:
         self._target_label     = None
         self._feedback_aliases = None
         self._final_creep_start = None
-        self._replan_pause = False
+        self._replan_pause     = False
         self._clear_follow_memory()
-        self._step_track_head = False
+        self._step_track_head  = False
         print(
             f"[SimpleExecutor] Moving toward: {self._aliases} "
             f"(LLM safety replan every {self.APPROACH_REPLAN_S:.0f}s, stop depth ≤{self.STOP_DISTANCE_M:.2f}m)"
         )
-        # One neutral head at approach start; pitch then tracks bbox (no per-frame HeadYaw writes).
         self._robot.reset_head_neutral()
         self._robot.start_walk(vx=self.APPROACH_VX)
 
@@ -159,22 +146,26 @@ class SimpleExecutor:
         self._mode = "STEP_FWD"
         self._prim_elapsed = 0.0
         self._step_track_head = bool(track_head)
+        
         if self._step_track_head:
             self._feedback_aliases = (
                 [a.lower().strip() for a in feedback_aliases if a and str(a).strip()]
-                if feedback_aliases
-                else None
+                if feedback_aliases else None
             )
         else:
             self._feedback_aliases = None
             self._robot.reset_head_neutral()
+            
         self._step_target_m = max(self.MIN_STEP_M, min(float(meters), self.MAX_STEP_M))
         self._step_start_xy = None
-        pos = self._robot.get_gps_position()
-        if pos is not None and len(pos) >= 2:
-            self._step_start_xy = (float(pos[0]), float(pos[1]))
-        base_t = self._step_target_m / max(self.FORWARD_MPS, 1e-6)
-        self._step_time_budget = base_t * (1.35 if self._step_start_xy else 1.55)
+        
+        current_gps = self._robot.get_gps_position()
+        if current_gps is not None and len(current_gps) >= 2:
+            self._step_start_xy = (float(current_gps[0]), float(current_gps[1]))
+            
+        base_time_seconds = self._step_target_m / max(self.FORWARD_MPS, 1e-6)
+        self._step_time_budget = base_time_seconds * (1.35 if self._step_start_xy else 1.55)
+        
         print(
             f"[SimpleExecutor] Step forward: target {self._step_target_m:.2f}m "
             f"(GPS={'yes' if self._step_start_xy else 'no'}, budget {self._step_time_budget:.1f}s)"
@@ -190,17 +181,19 @@ class SimpleExecutor:
         self._mode = "STEP_TURN"
         self._prim_elapsed = 0.0
         self._step_track_head = bool(track_head)
+        
         if self._step_track_head:
             self._feedback_aliases = (
                 [a.lower().strip() for a in feedback_aliases if a and str(a).strip()]
-                if feedback_aliases
-                else None
+                if feedback_aliases else None
             )
         else:
             self._feedback_aliases = None
             self._robot.reset_head_neutral()
+            
         self._turn_target_deg = max(-180.0, min(180.0, float(degrees)))
         self._turn_time_budget = abs(self._turn_target_deg) / max(self.TURN_DPS, 1e-6)
+        
         print(
             f"[SimpleExecutor] Step turn: {self._turn_target_deg:+.0f}° "
             f"(~{self._turn_time_budget:.1f}s @ {self.TURN_DPS}°/s)"
@@ -215,29 +208,27 @@ class SimpleExecutor:
             self._step_track_head = False
 
     @staticmethod
-    def _cx_abs_offset(obj: dict, pos: str) -> float:
-        c = obj.get("cx_norm")
-        if c is not None:
-            return abs(float(c) - 0.5)
-        if pos == "center":
+    def _cx_abs_offset(obj: dict, position: str) -> float:
+        center_x_norm = obj.get("cx_norm")
+        if center_x_norm is not None:
+            return abs(float(center_x_norm) - 0.5)
+        if position == "center":
             return 0.0
-        if pos == "left":
-            return 0.20
         return 0.20
 
-    def _horiz_centered(self, obj: dict, pos: str, tol: float) -> bool:
-        return self._cx_abs_offset(obj, pos) <= tol
+    def _horiz_centered(self, obj: dict, position: str, tolerance: float) -> bool:
+        return self._cx_abs_offset(obj, position) <= tolerance
 
     def _head_follow_bbox(self, obj: dict) -> None:
-        """Pitch only from bbox vertical position vs image center; yaw fixed at start of approach."""
-        pos = obj.get("position", "center")
-        cy = obj.get("cy_norm")
-        if cy is None:
-            cy = 0.65 if str(pos) in ("left", "right", "center") else 0.5
-        a = max(0.04, min(1.0, self._follow_look_alpha))
+        position = obj.get("position", "center")
+        center_y_norm = obj.get("cy_norm")
+        if center_y_norm is None:
+            center_y_norm = 0.65 if str(position) in ("left", "right", "center") else 0.5
+            
+        alpha = max(0.04, min(1.0, self._follow_look_alpha))
         self._robot.look_pitch_from_cy_norm(
-            float(cy),
-            alpha=a,
+            float(center_y_norm),
+            alpha=alpha,
             pitch_gain=self._follow_pitch_gain,
             cy_deadband=self._head_cy_deadband,
         )
@@ -251,31 +242,33 @@ class SimpleExecutor:
         self._prim_elapsed = 0.0
 
     def _remember_follow_target(self, obj: dict) -> None:
-        cx, cy = obj.get("cx_norm"), obj.get("cy_norm")
-        pos = obj.get("position", "center")
-        if cx is not None and cy is not None:
-            self._last_follow_cx = float(cx)
-            self._last_follow_cy = float(cy)
-            self._last_follow_pos = str(pos)
+        center_x_norm = obj.get("cx_norm")
+        center_y_norm = obj.get("cy_norm")
+        position = obj.get("position", "center")
+        
+        if center_x_norm is not None and center_y_norm is not None:
+            self._last_follow_cx = float(center_x_norm)
+            self._last_follow_cy = float(center_y_norm)
+            self._last_follow_pos = str(position)
             self._last_follow_valid = True
         else:
-            self._last_follow_cx = {"left": 0.32, "center": 0.5, "right": 0.68}.get(str(pos), 0.5)
+            self._last_follow_cx = {"left": 0.32, "center": 0.5, "right": 0.68}.get(str(position), 0.5)
             self._last_follow_cy = 0.65
-            self._last_follow_pos = str(pos)
+            self._last_follow_pos = str(position)
             self._last_follow_valid = True
 
     def _head_follow_scene_aliases(self, aliases: Optional[List[str]]) -> None:
-        """During dodge steps, keep head on the approach target if still visible."""
         if not aliases:
             return
         scene = self._latest_scene()
         if not scene:
             return
-        lock = self._target_label if self._target_label else None
-        m = match_target_in_scene(scene, aliases, locked_label=lock)
-        if m:
-            _lb, obj = m
-            self._head_follow_bbox(obj)
+            
+        locked_label = self._target_label if self._target_label else None
+        matched_target = match_target_in_scene(scene, aliases, locked_label=locked_label)
+        if matched_target:
+            _label, detected_object = matched_target
+            self._head_follow_bbox(detected_object)
 
     def _clear_follow_memory(self) -> None:
         self._last_follow_valid = False
@@ -283,22 +276,22 @@ class SimpleExecutor:
         self._last_follow_cy = None
         self._last_follow_pos = "center"
 
-    def tick(self, dt: float) -> None:
+    def tick(self, delta_time: float) -> None:
         if self._mode == "IDLE":
             return
 
-        self._elapsed   += dt
-        self._last_poll += dt
+        self._elapsed   += delta_time
+        self._last_poll += delta_time
 
         if self._last_poll >= self.POLL_INTERVAL_S:
             self._last_poll = 0.0
-            self._update(dt)
+            self._update(delta_time)
+
     def _update_crouch(self) -> None:
         self._prim_elapsed += self.POLL_INTERVAL_S
-        t = self._prim_elapsed
+        elapsed_time = self._prim_elapsed
 
-        # Write crouch targets on the very first tick; motors slew continuously.
-        if t <= self.POLL_INTERVAL_S * 2:
+        if elapsed_time <= self.POLL_INTERVAL_S * 2:
             self._robot.set_joint("LHipPitch",   -0.70)
             self._robot.set_joint("RHipPitch",   -0.70)
             self._robot.set_joint("LKneePitch",   1.30)
@@ -306,74 +299,50 @@ class SimpleExecutor:
             self._robot.set_joint("LAnklePitch", -0.55)
             self._robot.set_joint("RAnklePitch", -0.55)
 
-        # Allow 1.8 s for the joints to reach their targets, then report done.
-        # The robot stays crouched — the LLM can follow up with pick_object or
-        # instruct it to stand back up.
-        if t >= 1.8:
+        if elapsed_time >= 1.8:
             self.stop()
             self._on_status("ACTION_DONE: Crouch complete. What next?", None)
 
     def _update_pick(self) -> None:
         self._prim_elapsed += self.POLL_INTERVAL_S
-        t = self._prim_elapsed
+        elapsed_time = self._prim_elapsed
 
-        # ── Phase 1 (0.0 – 0.8 s): Look down + open hands ─────────────────────
-        # Set once at the start of each phase window; Webots motors slew
-        # continuously so we only need to write the target once per phase.
-        if t <= 0.8:
-            if t <= self.POLL_INTERVAL_S * 2:           # write target on first tick
+        if elapsed_time <= 0.8:
+            if elapsed_time <= self.POLL_INTERVAL_S * 2:
                 self._robot.set_head_pitch(0.5)
-                self._robot.set_joint("LHand", 1.0)     # 1.0 = fully open
+                self._robot.set_joint("LHand", 1.0)
                 self._robot.set_joint("RHand", 1.0)
 
-        # ── Phase 2 (0.8 – 2.0 s): Crouch + reach arms forward-and-down ───────
-        # NAO ShoulderPitch convention:
-        #   +π/2  ≈ arms straight down  (REST_POSE uses +1.4)
-        #   +π    ≈ arms pointing behind the robot
-        #   ~0    ≈ arms horizontal forward
-        #  −value ≈ arms above horizontal (pointing up) — NOT what we want here
-        # To reach a floor-level object ~0.21 m in front of the robot, we need
-        # ShoulderPitch ≈ +1.8–2.0 (arms angled well below horizontal).
-        elif 0.8 < t <= 2.0:
-            if 0.8 < t <= 0.8 + self.POLL_INTERVAL_S * 2:
-                # Bend legs to lower the torso
+        elif 0.8 < elapsed_time <= 2.0:
+            if 0.8 < elapsed_time <= 0.8 + self.POLL_INTERVAL_S * 2:
                 self._robot.set_joint("LHipPitch",    -0.70)
                 self._robot.set_joint("RHipPitch",    -0.70)
                 self._robot.set_joint("LKneePitch",    1.30)
                 self._robot.set_joint("RKneePitch",    1.30)
                 self._robot.set_joint("LAnklePitch",  -0.55)
                 self._robot.set_joint("RAnklePitch",  -0.55)
-
-                # Reach arms forward and DOWN (positive pitch ≈ arms lower)
                 self._robot.set_joint("LShoulderPitch",  1.80)
                 self._robot.set_joint("RShoulderPitch",  1.80)
-                # Narrow the arms slightly inward so both hands reach the same spot
                 self._robot.set_joint("LShoulderRoll",   0.15)
                 self._robot.set_joint("RShoulderRoll",  -0.15)
-                # Keep elbows roughly straight so arms reach far
                 self._robot.set_joint("LElbowYaw",      -1.50)
                 self._robot.set_joint("RElbowYaw",       1.50)
                 self._robot.set_joint("LElbowRoll",     -0.10)
                 self._robot.set_joint("RElbowRoll",      0.10)
 
-        # ── Phase 3 (2.0 – 2.6 s): Close hands to grip ─────────────────────────
-        elif 2.0 < t <= 2.6:
-            if 2.0 < t <= 2.0 + self.POLL_INTERVAL_S * 2:
-                self._robot.set_joint("LHand", 0.0)     # 0.0 = fully closed
+        elif 2.0 < elapsed_time <= 2.6:
+            if 2.0 < elapsed_time <= 2.0 + self.POLL_INTERVAL_S * 2:
+                self._robot.set_joint("LHand", 0.0)
                 self._robot.set_joint("RHand", 0.0)
 
-        # ── Phase 4 (2.6 – 4.0 s): Stand back up, arms in carry position ───────
-        elif 2.6 < t <= 4.0:
-            if 2.6 < t <= 2.6 + self.POLL_INTERVAL_S * 2:
-                # Return legs to rest pose
+        elif 2.6 < elapsed_time <= 4.0:
+            if 2.6 < elapsed_time <= 2.6 + self.POLL_INTERVAL_S * 2:
                 self._robot.set_joint("LHipPitch",   -0.45)
                 self._robot.set_joint("RHipPitch",   -0.45)
                 self._robot.set_joint("LKneePitch",   0.87)
                 self._robot.set_joint("RKneePitch",   0.87)
                 self._robot.set_joint("LAnklePitch", -0.41)
                 self._robot.set_joint("RAnklePitch", -0.41)
-
-                # Carry position: arms in front at roughly hip height
                 self._robot.set_joint("LShoulderPitch",  1.20)
                 self._robot.set_joint("RShoulderPitch",  1.20)
                 self._robot.set_joint("LShoulderRoll",   0.20)
@@ -384,12 +353,11 @@ class SimpleExecutor:
                 self._robot.set_joint("RElbowRoll",      0.80)
                 self._robot.set_head_pitch(0.0)
 
-        # ── Done: allow 4.5 s total for the animation to settle ────────────────
-        if t >= 4.5:
+        if elapsed_time >= 4.5:
             self.stop()
             self._on_status("ACTION_DONE: Pick object complete. What next?", None)
 
-    def _update(self, dt: float):
+    def _update(self, delta_time: float):
         if self._mode == "CROUCH":
             self._update_crouch()
             return
@@ -403,18 +371,18 @@ class SimpleExecutor:
             self._update_step_turn()
             return
 
-        match = self._check_scene()
+        matched_target = self._check_scene()
 
         if self._mode == "LOCATE":
-            if match:
+            if matched_target:
                 self._locate_seen_time += self.POLL_INTERVAL_S
                 if self._locate_seen_time >= 0.2:
-                    lbl, obj = match
-                    self._target_label = lbl
+                    label, detected_object = matched_target
+                    self._target_label = label
                     self._robot.stop_locomotion_only()
                     self._mode = "VERIFY_LOCATE"
                     self._verify_timer = 0.0
-                    print(f"[SimpleExecutor] Potential '{lbl}' spotted. Stopping to verify...")
+                    print(f"[SimpleExecutor] Potential '{label}' spotted. Stopping to verify...")
             else:
                 self._locate_seen_time = 0.0
 
@@ -425,10 +393,10 @@ class SimpleExecutor:
         elif self._mode == "VERIFY_LOCATE":
             self._verify_timer += self.POLL_INTERVAL_S
             if self._verify_timer >= 1.0:
-                if match:
-                    lbl, obj = match
+                if matched_target:
+                    label, detected_object = matched_target
                     self.stop()
-                    self._on_status(f"FOUND: {lbl}", obj)
+                    self._on_status(f"FOUND: {label}", detected_object)
                 else:
                     print(
                         f"[SimpleExecutor] False alarm on '{self._target_label}'. "
@@ -444,7 +412,7 @@ class SimpleExecutor:
             if not self._replan_pause:
                 self._checkpoint_timer += self.POLL_INTERVAL_S
 
-            if not match:
+            if not matched_target:
                 self._stuck_timer += self.POLL_INTERVAL_S
                 if self._last_follow_valid and self._last_follow_cx is not None and self._last_follow_cy is not None:
                     self._head_follow_bbox(
@@ -455,97 +423,94 @@ class SimpleExecutor:
                         }
                     )
                 if self._stuck_timer >= self.STUCK_THRESHOLD_S:
-                    print(f"[SimpleExecutor] Target lost. Initiating vertical look recovery...")
+                    print("[SimpleExecutor] Target lost. Initiating vertical look recovery...")
                     self._robot.stop_locomotion_only()
-                    self._mode = "RECOVERY_LOOK"   # <--- Transition to our new state
+                    self._mode = "RECOVERY_LOOK"
                     self._recovery_timer = 0.0
                 return
 
-            lbl, obj = match
-            self._target_label = lbl
+            label, detected_object = matched_target
+            self._target_label = label
             self._stuck_timer = 0.0
-            self._remember_follow_target(obj)
-            self._head_follow_bbox(obj)
+            self._remember_follow_target(detected_object)
+            self._head_follow_bbox(detected_object)
 
-            dist = obj.get("distance", "far")
-            real_dist = obj.get("distance_m")
-            pos = obj.get("position", "center")
-            if real_dist is not None:
+            distance_bucket = detected_object.get("distance", "far")
+            real_distance_m = detected_object.get("distance_m")
+            position = detected_object.get("position", "center")
+            
+            if real_distance_m is not None:
                 try:
-                    self._last_known_dist_m = float(real_dist)
+                    self._last_known_dist_m = float(real_distance_m)
                 except (TypeError, ValueError):
                     pass
-            hf_obj = obj.get("height_frac")
-            hf_val = float(hf_obj) if hf_obj is not None else _height_frac_from_bucket(dist)
-            centered_loose = self._horiz_centered(obj, pos, 0.17)
-            centered_tight = self._horiz_centered(obj, pos, 0.12)
+                    
+            height_frac_obj = detected_object.get("height_frac")
+            height_frac_val = float(height_frac_obj) if height_frac_obj is not None else _height_frac_from_bucket(distance_bucket)
+            centered_loose = self._horiz_centered(detected_object, position, 0.17)
+            centered_tight = self._horiz_centered(detected_object, position, 0.12)
 
-            if hf_val < self.CREEP_ENTER_HF - 0.06:
+            if height_frac_val < self.CREEP_ENTER_HF - 0.06:
                 self._final_creep_start = None
             elif centered_loose and self._final_creep_start is None:
                 self._final_creep_start = self._elapsed
 
-            creep_age = (
-                (self._elapsed - self._final_creep_start)
-                if self._final_creep_start is not None
-                else 0.0
-            )
+            creep_age = (self._elapsed - self._final_creep_start) if self._final_creep_start is not None else 0.0
 
             super_close = False
-            # When RangeFinder depth is available, **only** depth vs STOP_DISTANCE_M (~2 ft)
-            # ends the approach. Bbox / creep heuristics alone caused early completion (large
-            # bbox but still >2 ft away).
-            if real_dist is not None and centered_loose:
+            if real_distance_m is not None and centered_loose:
                 try:
-                    if float(real_dist) <= self.STOP_DISTANCE_M:
+                    if float(real_distance_m) <= self.STOP_DISTANCE_M:
                         super_close = True
                 except (TypeError, ValueError):
                     pass
 
-            if not super_close and real_dist is None and self._elapsed >= 0.35:
-                if hf_val >= 0.66 and self._horiz_centered(obj, pos, 0.22):
+            if not super_close and real_distance_m is None and self._elapsed >= 0.35:
+                if height_frac_val >= 0.66 and self._horiz_centered(detected_object, position, 0.22):
                     super_close = True
-                elif hf_val >= self.SUPER_CLOSE_HF and centered_loose:
+                elif height_frac_val >= self.SUPER_CLOSE_HF and centered_loose:
                     super_close = True
-                elif hf_val >= 0.56 and dist == "very_near" and centered_tight:
+                elif height_frac_val >= 0.56 and distance_bucket == "very_near" and centered_tight:
                     super_close = True
                 elif (
                     self._final_creep_start is not None
                     and creep_age >= self.FINAL_CREEP_TIMEOUT_S
-                    and hf_val >= self.FORCE_SUPER_CLOSE_HF
+                    and height_frac_val >= self.FORCE_SUPER_CLOSE_HF
                     and centered_loose
                 ):
                     super_close = True
 
             if super_close:
                 self._replan_pause = False
-                self._head_follow_bbox(obj)
-                ft_s = ""
-                if real_dist is not None:
+                self._head_follow_bbox(detected_object)
+                
+                distance_feet_str = ""
+                if real_distance_m is not None:
                     try:
-                        m = float(real_dist)
-                        ft_s = f" (~{m * 3.280839895013123:.2f} ft, {m:.3f} m RangeFinder)"
+                        distance_meters = float(real_distance_m)
+                        distance_feet_str = f" (~{distance_meters * 3.280839895013123:.2f} ft, {distance_meters:.3f} m RangeFinder)"
                     except (TypeError, ValueError):
-                        ft_s = ""
+                        pass
+                        
                 self.stop()
-                dist_msg = (
-                    f"distance_m={float(real_dist):.3f} m{ft_s}"
-                    if real_dist is not None
-                    else f"distance={dist}"
+                distance_msg = (
+                    f"distance_m={float(real_distance_m):.3f} m{distance_feet_str}"
+                    if real_distance_m is not None
+                    else f"distance={distance_bucket}"
                 )
                 self._on_status(
-                    f"SUPER_CLOSE: {lbl} (height_frac={hf_val:.2f}, {dist_msg}) "
+                    f"SUPER_CLOSE: {label} (height_frac={height_frac_val:.2f}, {distance_msg}) "
                     "— final approach threshold met.",
-                    obj,
+                    detected_object,
                 )
                 return
 
-            curr_h = float(obj.get("height_frac")) if obj.get("height_frac") is not None else _height_frac_from_bucket(
-                obj.get("distance", "far")
+            current_height_frac = float(detected_object.get("height_frac")) if detected_object.get("height_frac") is not None else _height_frac_from_bucket(
+                detected_object.get("distance", "far")
             )
 
-            if curr_h > self._max_h_frac:
-                self._max_h_frac = curr_h
+            if current_height_frac > self._max_h_frac:
+                self._max_h_frac = current_height_frac
                 self._stuck_timer = 0.0
             else:
                 self._stuck_timer += self.POLL_INTERVAL_S
@@ -554,12 +519,12 @@ class SimpleExecutor:
             if self._stuck_timer >= stuck_budget:
                 self._replan_pause = False
                 self.stop()
-                hf = obj.get("height_frac")
-                hf_s = f"{hf}" if hf is not None else "?"
+                height_frac = detected_object.get("height_frac")
+                height_frac_str = f"{height_frac}" if height_frac is not None else "?"
                 self._on_status(
-                    f"STUCK: {lbl} | height_frac={hf_s} distance={dist} position={pos} "
+                    f"STUCK: {label} | height_frac={height_frac_str} distance={distance_bucket} position={position} "
                     f"(no bbox growth ~{stuck_budget:.0f}s)",
-                    obj,
+                    detected_object,
                 )
                 return
 
@@ -568,72 +533,61 @@ class SimpleExecutor:
                 self._replan_pause = True
                 self._robot.stop_locomotion_only()
                 scene = self._latest_scene() or {}
-                son = scene.get("sonar", {})
-                left = son.get("left_m", "?")
-                right = son.get("right_m", "?")
-                dm_p = (
-                    f"distance_m={real_dist}"
-                    if real_dist is not None
-                    else "distance_m=n/a"
-                )
+                sonar = scene.get("sonar", {})
+                left_m = sonar.get("left_m", "?")
+                right_m = sonar.get("right_m", "?")
+                distance_m_display = f"distance_m={real_distance_m}" if real_distance_m is not None else "distance_m=n/a"
+                
                 self._on_status(
-                    f"APPROACH_CHECKPOINT: Feet paused (head still tracking). Approaching '{lbl}'. "
-                    f"{dm_p}, height_frac={obj.get('height_frac')}, bbox position={pos}. "
-                    f"Sonar left_m={left}, right_m={right}. "
+                    f"APPROACH_CHECKPOINT: Feet paused (head still tracking). Approaching '{label}'. "
+                    f"{distance_m_display}, height_frac={detected_object.get('height_frac')}, bbox position={position}. "
+                    f"Sonar left_m={left_m}, right_m={right_m}. "
                     f"Goal: approach until distance_m <= {self.STOP_DISTANCE_M:.2f} m. "
                     "Return **move_to_object** with the **same aliases** to continue, "
                     "or **turn_degrees** / **move_forward** (small) to dodge. "
                     "Head pitch follows the target vertically automatically (not LLM) — one action per response.",
-                    obj,
+                    detected_object,
                 )
                 return
 
             if self._replan_pause:
                 return
 
-            if pos == "left":
+            if position == "left":
                 self._robot.start_walk(vx=0.0, omega=self.TURN_OMEGA)
-            elif pos == "right":
+            elif position == "right":
                 self._robot.start_walk(vx=0.0, omega=-self.TURN_OMEGA)
             else:
-                use_creep = hf_val >= self.CREEP_ENTER_HF and centered_loose
-                vx = self.CREEP_VX if use_creep else self.APPROACH_VX
-                self._robot.start_walk(vx=vx, omega=0.0)
+                use_creep = height_frac_val >= self.CREEP_ENTER_HF and centered_loose
+                velocity_x = self.CREEP_VX if use_creep else self.APPROACH_VX
+                self._robot.start_walk(vx=velocity_x, omega=0.0)
 
         elif self._mode == "RECOVERY_LOOK":
-            
             self._recovery_timer += self.POLL_INTERVAL_S
             
-            # 1. Did the object come back into view during the sweep?
-            if match:
-                lbl, obj = match
-                print(f"[SimpleExecutor] Target '{lbl}' re-acquired during sweep! Resuming approach.")
-                self._target_label = lbl
+            if matched_target:
+                label, detected_object = matched_target
+                print(f"[SimpleExecutor] Target '{label}' re-acquired during sweep! Resuming approach.")
+                self._target_label = label
                 self._stuck_timer = 0.0
                 self._mode = "MOVE"
-                self._remember_follow_target(obj)
+                self._remember_follow_target(detected_object)
                 self._robot.start_walk(vx=self.APPROACH_VX)
                 return
             
-            # 2. Perform the vertical head sweep over ~4.5 seconds
             if self._recovery_timer < 1.5:
-                # Look UP
                 self._robot.set_head_pitch(-0.4) 
             elif self._recovery_timer < 3.5:
-                # Look DOWN
                 self._robot.set_head_pitch(0.5)  
             elif self._recovery_timer < 4.5:
-                # Return to NEUTRAL
                 self._robot.set_head_pitch(0.0)  
             else:
-                # 3. Sweep failed. Did we lose it while close?
                 if self._last_known_dist_m is not None and self._last_known_dist_m < 1.5:
-                    # Calculate remaining distance to our 0.21m goal
                     remaining_dist = max(0.0, self._last_known_dist_m - self.STOP_DISTANCE_M)
-                    # Math assumes instant top speed. Add a 1.5x multiplier for startup 
-                    # friction, and force a minimum of 1.5 seconds so it actually steps.
-                    base_time = remaining_dist / max(self.APPROACH_VX, 0.01)
-                    self._blind_move_budget = max(1.5, base_time * 1.5)
+                    
+                    # Add startup friction buffer to the blind move
+                    base_time_seconds = remaining_dist / max(self.APPROACH_VX, 0.01)
+                    self._blind_move_budget = max(1.5, base_time_seconds * 1.5)
                     
                     print(f"[SimpleExecutor] Sweep failed, but last known distance was {self._last_known_dist_m:.2f}m. Initiating blind approach for {remaining_dist:.2f}m (~{self._blind_move_budget:.1f}s).")
                     
@@ -647,21 +601,20 @@ class SimpleExecutor:
                         f"LOST: Target {self._target_label or self._aliases} disappeared",
                         None,
                     )
+                    
         elif self._mode == "BLIND_APPROACH":
             self._blind_move_timer += self.POLL_INTERVAL_S
             
-            # If the object magically re-enters the camera frame, snap back to normal MOVE!
-            if match:
-                lbl, obj = match
-                print(f"[SimpleExecutor] Target '{lbl}' re-acquired during blind approach! Resuming normal tracking.")
-                self._target_label = lbl
+            if matched_target:
+                label, detected_object = matched_target
+                print(f"[SimpleExecutor] Target '{label}' re-acquired during blind approach! Resuming normal tracking.")
+                self._target_label = label
                 self._stuck_timer = 0.0
                 self._mode = "MOVE"
-                self._remember_follow_target(obj)
+                self._remember_follow_target(detected_object)
                 self._robot.start_walk(vx=self.APPROACH_VX)
                 return
             
-            # Otherwise, keep walking blindly until we cover the calculated remaining distance
             if self._blind_move_timer >= self._blind_move_budget:
                 self.stop()
                 self._on_status(
@@ -678,51 +631,59 @@ class SimpleExecutor:
 
     def _update_step_forward(self) -> None:
         self._prim_elapsed += self.POLL_INTERVAL_S
+        
         if self._step_track_head:
             self._head_follow_scene_aliases(self._feedback_aliases)
-        done = False
+            
+        target_reached = False
         if self._step_start_xy is not None:
-            pos = self._robot.get_gps_position()
-            if pos is not None and len(pos) >= 2:
-                d = math.hypot(
-                    float(pos[0]) - self._step_start_xy[0],
-                    float(pos[1]) - self._step_start_xy[1],
+            current_pos = self._robot.get_gps_position()
+            if current_pos is not None and len(current_pos) >= 2:
+                distance_traveled = math.hypot(
+                    float(current_pos[0]) - self._step_start_xy[0],
+                    float(current_pos[1]) - self._step_start_xy[1],
                 )
-                if d >= self._step_target_m * 0.9:
-                    done = True
-        if not done and self._prim_elapsed >= self._step_time_budget:
-            done = True
+                if distance_traveled >= self._step_target_m * 0.9:
+                    target_reached = True
+                    
+        if not target_reached and self._prim_elapsed >= self._step_time_budget:
+            target_reached = True
+            
         if self._prim_elapsed >= self.MAX_PRIMITIVE_S:
             self.stop()
             self._emit_step_done(
                 f"STEP_ABORT: move_forward exceeded {self.MAX_PRIMITIVE_S:.0f}s",
             )
             return
-        if done:
+            
+        if target_reached:
             self.stop()
             self._emit_step_done(f"STEP_DONE: move_forward ~{self._step_target_m:.2f}m")
 
     def _update_step_turn(self) -> None:
         self._prim_elapsed += self.POLL_INTERVAL_S
+        
         if self._step_track_head:
             self._head_follow_scene_aliases(self._feedback_aliases)
+            
         if self._prim_elapsed >= self.MAX_PRIMITIVE_S:
             self.stop()
             self._emit_step_done(
                 f"STEP_ABORT: turn_degrees exceeded {self.MAX_PRIMITIVE_S:.0f}s",
             )
             return
+            
         if self._prim_elapsed >= self._turn_time_budget:
             self.stop()
             self._emit_step_done(f"STEP_DONE: turn_degrees {self._turn_target_deg:+.0f}°")
 
-    def _emit_step_done(self, base: str) -> None:
+    def _emit_step_done(self, base_status: str) -> None:
         scene = self._latest_scene()
         if self._feedback_aliases:
-            fb = format_feedback_line(scene, self._feedback_aliases)
-            self._on_status(f"{base}\n{fb}", None)
+            feedback_message = format_feedback_line(scene, self._feedback_aliases)
+            self._on_status(f"{base_status}\n{feedback_message}", None)
         else:
-            self._on_status(base, None)
+            self._on_status(base_status, None)
         self._feedback_aliases = None
 
     def _check_scene(self):
@@ -730,16 +691,16 @@ class SimpleExecutor:
         if not scene:
             return None
         objects = scene.get("objects", [])
-        for obj in objects:
-            lbl = obj.get("label", "").lower()
-            if self._target_label and lbl != self._target_label:
+        for detected_object in objects:
+            label = detected_object.get("label", "").lower()
+            if self._target_label and label != self._target_label:
                 continue
             for alias in self._aliases:
-                if alias in lbl or lbl in alias:
-                    return lbl, obj
+                if alias in label or label in alias:
+                    return label, detected_object
         return None
 
 
 def _height_frac_from_bucket(bucket: str) -> float:
-    h_map = {"very_near": 0.45, "near": 0.26, "medium": 0.10, "far": 0.04}
-    return h_map.get(bucket, 0.04)
+    height_mapping = {"very_near": 0.45, "near": 0.26, "medium": 0.10, "far": 0.04}
+    return height_mapping.get(bucket, 0.04)
